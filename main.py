@@ -3,12 +3,15 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import re
+import socket
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
+from urllib.error import HTTPError, URLError
 from urllib.request import Request as UrlRequest, urlopen
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
@@ -32,6 +35,10 @@ from models.schemas import (
     UiSpoolSetStartRequest,
     UiSlotResetRequest,
     UiSlotUpdateRequest,
+    UiPrinterConfigRequest,
+    UiSpoolmanConfigRequest,
+    UiSpoolmanMappingRequest,
+    UiSpoolmanRetryRequest,
     UpdateSlotRequest,
 )
 
@@ -65,6 +72,7 @@ STATIC_DIR = APP_DIR / "static"
 STATE_PATH = DATA_DIR / "state.json"
 PROFILES_PATH = DATA_DIR / "profiles.json"
 CONFIG_PATH = DATA_DIR / "config.json"
+MOONRAKER_POLL_TASK: Optional[asyncio.Task] = None
 
 DEFAULT_SLOTS = [
     "1A", "1B", "1C", "1D",
@@ -73,9 +81,152 @@ DEFAULT_SLOTS = [
     "4A", "4B", "4C", "4D",
 ]
 
+SPOOLMAN_SYNC_STATUSES = {
+    "pending",
+    "dry_run",
+    "synced",
+    "skipped_unmapped",
+    "skipped_invalid_spool",
+    "failed",
+    "timeout_uncertain",
+    "conflict",
+}
+
 
 def _now() -> float:
     return time.time()
+
+
+def _default_spoolman_config() -> dict:
+    return {
+        "enabled": False,
+        "dry_run": True,
+        "url": "",
+        "sync_mode": "post_print",
+        "timeout_sec": 5,
+        "slot_mappings": {sid: None for sid in DEFAULT_SLOTS},
+    }
+
+
+def _default_spoolman_status() -> dict:
+    return {
+        "connected": False,
+        "last_check_at": 0.0,
+        "last_error": "",
+        "dry_run": True,
+        "moonraker_native_detected": False,
+        "moonraker_native_warning": "",
+    }
+
+
+def _normalize_spoolman_config(cfg: dict) -> dict:
+    out = _default_spoolman_config()
+    raw = None
+    if isinstance(cfg, dict):
+        raw = cfg.get("spoolman") if isinstance(cfg.get("spoolman"), dict) else cfg
+    if isinstance(raw, dict):
+        out.update({k: v for k, v in raw.items() if k != "slot_mappings"})
+
+        mappings = dict(out["slot_mappings"])
+        raw_map = raw.get("slot_mappings")
+        if isinstance(raw_map, dict):
+            for sid, val in raw_map.items():
+                sid_s = str(sid).strip().upper()
+                if sid_s not in mappings:
+                    continue
+                try:
+                    iv = int(val) if val not in (None, "") else None
+                    mappings[sid_s] = iv if iv and iv > 0 else None
+                except Exception:
+                    mappings[sid_s] = None
+        out["slot_mappings"] = mappings
+
+    out["enabled"] = bool(out.get("enabled", False))
+    out["dry_run"] = bool(out.get("dry_run", True))
+    out["url"] = str(out.get("url") or "").strip().rstrip("/")
+    try:
+        timeout = float(out.get("timeout_sec", 5) or 5)
+        out["timeout_sec"] = max(1.0, min(timeout, 30.0))
+    except Exception:
+        out["timeout_sec"] = 5.0
+    if str(out.get("sync_mode") or "") != "post_print":
+        out["sync_mode"] = "post_print"
+    return out
+
+
+def _spoolman_public_config() -> dict:
+    cfg = _normalize_spoolman_config(load_config())
+    return {
+        "enabled": cfg["enabled"],
+        "dry_run": cfg["dry_run"],
+        "url": cfg["url"],
+        "sync_mode": cfg["sync_mode"],
+        "timeout_sec": cfg["timeout_sec"],
+        "slot_mappings": cfg["slot_mappings"],
+    }
+
+
+def _normalize_printer_config(cfg: dict) -> dict:
+    raw = cfg if isinstance(cfg, dict) else {}
+    out = {
+        "moonraker_url": str(raw.get("moonraker_url") or "").strip().rstrip("/"),
+        "poll_interval_sec": 5.0,
+        "filament_diameter_mm": 1.75,
+        "cfs_autosync": bool(raw.get("cfs_autosync", False)),
+    }
+    try:
+        poll_raw = raw.get("poll_interval_sec", 5)
+        out["poll_interval_sec"] = max(1.0, min(float(poll_raw if poll_raw is not None else 5), 60.0))
+    except Exception:
+        out["poll_interval_sec"] = 5.0
+    try:
+        diameter_raw = raw.get("filament_diameter_mm", 1.75)
+        out["filament_diameter_mm"] = max(0.5, min(float(diameter_raw if diameter_raw is not None else 1.75), 5.0))
+    except Exception:
+        out["filament_diameter_mm"] = 1.75
+    return out
+
+
+def _printer_public_config() -> dict:
+    return _normalize_printer_config(load_config())
+
+
+def _spoolman_record_key(job_key: str, slot_id: str) -> str:
+    return f"{str(job_key or '').strip()}:{str(slot_id or '').strip().upper()}"
+
+
+def _stable_print_key(job_name: str, start_ts: float, end_ts: float, job_id: Optional[str] = None) -> str:
+    """Build a stable print-instance key for idempotent per-slot sync records."""
+    jid = str(job_id or "").strip()
+    if jid:
+        return f"moonraker:{jid}"
+    safe_name = str(job_name or "").strip() or "unknown-job"
+    try:
+        start_i = int(float(start_ts or 0))
+    except Exception:
+        start_i = 0
+    try:
+        end_i = int(float(end_ts or 0))
+    except Exception:
+        end_i = 0
+    return f"local:{safe_name}:{start_i}:{end_i}"
+
+
+def _moonraker_current_job_id(print_stats: dict, virtual_sdcard: dict) -> str:
+    """Best-effort current job id extraction across Moonraker/Creality variants."""
+    candidates = []
+    if isinstance(print_stats, dict):
+        candidates.extend([print_stats.get("job_id"), print_stats.get("uid"), print_stats.get("id")])
+    if isinstance(virtual_sdcard, dict):
+        candidates.extend([virtual_sdcard.get("job_id"), virtual_sdcard.get("uid"), virtual_sdcard.get("id")])
+        cpd = virtual_sdcard.get("cur_print_data")
+        if isinstance(cpd, dict):
+            candidates.extend([cpd.get("job_id"), cpd.get("uid"), cpd.get("id")])
+    for val in candidates:
+        s = str(val or "").strip()
+        if s:
+            return s
+    return ""
 
 
 def _parse_iso_ts(val: str) -> Optional[float]:
@@ -126,6 +277,7 @@ def _ensure_data_files() -> None:
                     "filament_diameter_mm": 1.75,
                     # If true, import material/color/name from detected CFS objects into local slots (read-only to printer)
                     "cfs_autosync": False,
+                    "spoolman": _default_spoolman_config(),
                 },
                 indent=2,
                 ensure_ascii=False,
@@ -137,7 +289,7 @@ def _ensure_data_files() -> None:
         for s in DEFAULT_SLOTS:
             slots[s] = _model_dump(SlotState(slot=s))
         state = {
-            "active_slot": "2A",
+            "active_slot": "1A",
             "auto_mode": False,
             "slots": slots,
             "current_job": "",
@@ -149,15 +301,25 @@ def _ensure_data_files() -> None:
             "slot_history": {},
             # in-flight job attribution (persisted so a restart doesn't lose the active print)
             "job_track_name": "",
+            "job_track_id": "",
             "job_track_started_at": 0.0,
             "job_track_last_mm": 0,
             "job_track_slot_mm": {},
             "job_track_slot_g": {},
             "job_track_last_state": "",
+            "job_track_file_path": "",
+            "job_track_last_file_position": 0,
+            "job_track_file_size": 0,
+            "job_track_extruder_mode": "relative",
+            "job_track_last_e": 0.0,
+            "job_track_parser_slot": "",
+            "job_track_parser_tail": "",
             # snapshot from Moonraker history (global list)
             "moonraker_history": [],
             # local manual allocations for Moonraker history -> slots
             "moonraker_allocations": {},
+            "spoolman_status": _default_spoolman_status(),
+            "spoolman_sync_records": {},
             "updated_at": _now(),
         }
         STATE_PATH.write_text(json.dumps(state, indent=2, ensure_ascii=False))
@@ -181,6 +343,7 @@ def load_config() -> dict:
             "poll_interval_sec": 5,
             "filament_diameter_mm": 1.75,
             "cfs_autosync": False,
+            "spoolman": _default_spoolman_config(),
         }
 
 
@@ -229,7 +392,7 @@ def _migrate_state_dict(data: dict) -> dict:
                 sd["manufacturer"] = sd.pop("vendor")
             # tolerate placeholders for material
             mat = sd.get("material")
-            if isinstance(mat, str) and mat.strip() in ("", "-", "—", "–"):
+            if isinstance(mat, str) and mat.strip() in ("", "-", "\u2014", "\u2013"):
                 sd["material"] = "OTHER"
             # allow 'remaining_g' as int
             if "remaining_g" in sd and sd["remaining_g"] is not None:
@@ -269,15 +432,44 @@ def _migrate_state_dict(data: dict) -> dict:
     # --- history defaults ---
     data.setdefault("slot_history", {})
     data.setdefault("job_track_name", "")
+    data.setdefault("job_track_id", "")
     data.setdefault("job_track_started_at", 0.0)
     data.setdefault("job_track_last_mm", 0)
     data.setdefault("job_track_slot_mm", {})
     data.setdefault("job_track_slot_g", {})
     data.setdefault("job_track_last_state", "")
+    data.setdefault("job_track_file_path", "")
+    data.setdefault("job_track_last_file_position", 0)
+    data.setdefault("job_track_file_size", 0)
+    data.setdefault("job_track_extruder_mode", "relative")
+    data.setdefault("job_track_last_e", 0.0)
+    data.setdefault("job_track_parser_slot", "")
+    data.setdefault("job_track_parser_tail", "")
 
     # Moonraker history snapshot
     data.setdefault("moonraker_history", [])
     data.setdefault("moonraker_allocations", {})
+
+    # Spoolman sync state
+    status = data.get("spoolman_status")
+    if not isinstance(status, dict):
+        status = {}
+    merged_status = _default_spoolman_status()
+    merged_status.update(status)
+    data["spoolman_status"] = merged_status
+
+    records = data.get("spoolman_sync_records")
+    if not isinstance(records, dict):
+        records = {}
+    for key, rec in list(records.items()):
+        if not isinstance(rec, dict):
+            records.pop(key, None)
+            continue
+        status_val = str(rec.get("status") or "").strip()
+        if status_val not in SPOOLMAN_SYNC_STATUSES:
+            rec["status"] = "failed" if status_val else "pending"
+        records[key] = rec
+    data["spoolman_sync_records"] = records
 
     return data
 
@@ -441,6 +633,553 @@ def _http_get_json(url: str, timeout: float = 2.5) -> dict:
     return json.loads(raw)
 
 
+_GCODE_E_RE = re.compile(r"(?:^|\s)E([-+]?(?:\d+(?:\.\d*)?|\.\d+))", re.IGNORECASE)
+_GCODE_TOOL_DIRECT_RE = re.compile(r"^T([1-4])([A-D])(?:\s|$)", re.IGNORECASE)
+_GCODE_TOOL_INDEX_RE = re.compile(r"^T([0-3])(?:\s|$)", re.IGNORECASE)
+
+
+def _job_track_total_mm(state: AppState) -> int:
+    try:
+        return int(round(sum(float(v or 0) for v in (state.job_track_slot_mm or {}).values())))
+    except Exception:
+        return 0
+
+
+def _moonraker_gcode_path(filename: str, virtual_sdcard: dict) -> str:
+    candidates = []
+    if isinstance(virtual_sdcard, dict):
+        candidates.append(virtual_sdcard.get("file_path"))
+        cpd = virtual_sdcard.get("cur_print_data")
+        if isinstance(cpd, dict):
+            candidates.extend([cpd.get("file_path"), cpd.get("filename"), cpd.get("name")])
+    candidates.append(filename)
+    for val in candidates:
+        raw = str(val or "").strip()
+        if not raw:
+            continue
+        raw = raw.replace("\\", "/")
+        marker = "/gcodes/"
+        if marker in raw:
+            raw = raw.split(marker, 1)[1]
+        elif raw.startswith("/"):
+            raw = raw.rsplit("/", 1)[-1]
+        return raw.lstrip("/")
+    return ""
+
+
+def _moonraker_file_url(base: str, gcode_path: str) -> str:
+    base = str(base or "").strip().rstrip("/")
+    safe_path = "/".join(quote(part, safe="") for part in str(gcode_path or "").split("/") if part)
+    return f"{base}/server/files/gcodes/{safe_path}"
+
+
+def _http_get_text_range(url: str, start: int, end: int, timeout: float = 10.0) -> str:
+    start_i = max(0, int(start or 0))
+    end_i = max(start_i, int(end or 0))
+    headers = {
+        "User-Agent": "filament-manager/1.0",
+        "Range": f"bytes={start_i}-{end_i}",
+    }
+    req = UrlRequest(url, headers=headers)
+    with urlopen(req, timeout=timeout) as r:
+        data = r.read()
+        status = int(getattr(r, "status", 200) or 200)
+    if status == 200 and start_i > 0:
+        data = data[start_i : end_i + 1]
+    return data.decode("utf-8", errors="ignore")
+
+
+def _gcode_tool_to_slot(command: str) -> Optional[str]:
+    cmd = str(command or "").strip().upper()
+    direct = _GCODE_TOOL_DIRECT_RE.match(cmd)
+    if direct:
+        return f"{direct.group(1)}{direct.group(2)}"
+    indexed = _GCODE_TOOL_INDEX_RE.match(cmd)
+    if indexed:
+        idx = int(indexed.group(1))
+        return f"1{'ABCD'[idx]}"
+    return None
+
+
+def _parse_gcode_usage_chunk(
+    state: AppState,
+    text: str,
+    *,
+    fallback_slot: str = "",
+    final: bool = False,
+) -> int:
+    chunk = f"{state.job_track_parser_tail or ''}{text or ''}"
+    if not chunk:
+        return 0
+
+    lines = chunk.splitlines(keepends=True)
+    if lines and not (chunk.endswith("\n") or chunk.endswith("\r")) and not final:
+        state.job_track_parser_tail = lines.pop()
+    else:
+        state.job_track_parser_tail = ""
+
+    current_slot = str(state.job_track_parser_slot or fallback_slot or state.cfs_active_slot or state.active_slot or "").strip().upper()
+    mode = str(state.job_track_extruder_mode or "relative").strip().lower()
+    if mode not in ("relative", "absolute"):
+        mode = "relative"
+    last_e = float(state.job_track_last_e or 0.0)
+    added_total = 0
+
+    for raw_line in lines:
+        line = raw_line.split(";", 1)[0].strip()
+        if not line:
+            continue
+        upper = line.upper()
+
+        slot = _gcode_tool_to_slot(upper)
+        if slot:
+            current_slot = slot
+            continue
+
+        if upper.startswith("M83"):
+            mode = "relative"
+            continue
+        if upper.startswith("M82"):
+            mode = "absolute"
+            continue
+        if upper.startswith("G92"):
+            e_match = _GCODE_E_RE.search(upper)
+            if e_match:
+                try:
+                    last_e = float(e_match.group(1))
+                except Exception:
+                    last_e = 0.0
+            continue
+        if not (upper.startswith("G0") or upper.startswith("G1")):
+            continue
+
+        e_match = _GCODE_E_RE.search(upper)
+        if not e_match:
+            continue
+        try:
+            e_val = float(e_match.group(1))
+        except Exception:
+            continue
+
+        if mode == "absolute":
+            delta = e_val - last_e
+            last_e = e_val
+        else:
+            delta = e_val
+        if delta <= 0:
+            continue
+
+        slot_id = current_slot if current_slot in DEFAULT_SLOTS else fallback_slot
+        if not slot_id:
+            continue
+        delta_mm = float(delta)
+        if delta_mm <= 0:
+            continue
+        state.job_track_slot_mm[slot_id] = float(state.job_track_slot_mm.get(slot_id, 0.0)) + delta_mm
+        added_total += int(round(delta_mm))
+        try:
+            mat = state.slots.get(slot_id).material if slot_id in state.slots else "OTHER"
+            g_delta = float(mm_to_g(str(mat), float(delta_mm)))
+        except Exception:
+            g_delta = 0.0
+        if g_delta > 0:
+            state.job_track_slot_g[slot_id] = float(state.job_track_slot_g.get(slot_id, 0.0)) + g_delta
+            _inc_slot_epoch_consumed(state, slot_id, float(g_delta))
+
+    state.job_track_parser_slot = current_slot
+    state.job_track_extruder_mode = mode
+    state.job_track_last_e = float(last_e)
+    return added_total
+
+
+def _track_usage_from_gcode_file(
+    state: AppState,
+    *,
+    base_url: str,
+    filename: str,
+    virtual_sdcard: dict,
+    file_position: int,
+    fallback_slot: str,
+) -> bool:
+    gcode_path = _moonraker_gcode_path(filename, virtual_sdcard)
+    if not gcode_path:
+        return False
+
+    if state.job_track_file_path and state.job_track_file_path != gcode_path:
+        state.job_track_last_file_position = 0
+        state.job_track_file_size = 0
+        state.job_track_parser_tail = ""
+        state.job_track_last_e = 0.0
+        state.job_track_parser_slot = ""
+    state.job_track_file_path = gcode_path
+
+    last_pos = int(state.job_track_last_file_position or 0)
+    curr_pos = int(max(0, file_position or 0))
+    if curr_pos <= last_pos:
+        return True
+
+    url = _moonraker_file_url(base_url, gcode_path)
+    chunk = _http_get_text_range(url, last_pos, curr_pos - 1)
+    _parse_gcode_usage_chunk(state, chunk, fallback_slot=fallback_slot)
+    state.job_track_last_file_position = curr_pos
+    state.job_track_last_mm = _job_track_total_mm(state)
+    return True
+
+
+def _finish_gcode_usage_tracking(
+    state: AppState,
+    *,
+    base_url: str,
+    fallback_slot: str,
+    completed: bool,
+) -> None:
+    if not completed:
+        _parse_gcode_usage_chunk(state, "", fallback_slot=fallback_slot, final=True)
+        state.job_track_last_mm = _job_track_total_mm(state)
+        return
+    gcode_path = str(state.job_track_file_path or "").strip()
+    file_size = int(state.job_track_file_size or 0)
+    last_pos = int(state.job_track_last_file_position or 0)
+    if gcode_path and file_size > last_pos:
+        url = _moonraker_file_url(base_url, gcode_path)
+        chunk = _http_get_text_range(url, last_pos, file_size - 1)
+        _parse_gcode_usage_chunk(state, chunk, fallback_slot=fallback_slot, final=True)
+        state.job_track_last_file_position = file_size
+    else:
+        _parse_gcode_usage_chunk(state, "", fallback_slot=fallback_slot, final=True)
+    state.job_track_last_mm = _job_track_total_mm(state)
+
+
+class SpoolmanTimeoutError(Exception):
+    pass
+
+
+class SpoolmanHttpError(Exception):
+    def __init__(self, status_code: int, message: str):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def _spoolman_build_url(path: str, cfg: Optional[dict] = None) -> str:
+    scfg = _normalize_spoolman_config(cfg or load_config())
+    base = scfg.get("url") or ""
+    if not base:
+        raise SpoolmanHttpError(0, "Spoolman URL is not configured")
+    p = str(path or "").strip()
+    if not p.startswith("/"):
+        p = "/" + p
+    if not p.startswith("/api/v1/") and p != "/api/v1":
+        p = "/api/v1" + p
+    return base.rstrip("/") + p
+
+
+def _spoolman_request_json(path: str, *, method: str = "GET", payload: Optional[dict] = None, cfg: Optional[dict] = None) -> dict:
+    scfg = _normalize_spoolman_config(cfg or load_config())
+    url = _spoolman_build_url(path, scfg)
+    data = None
+    headers = {"User-Agent": "spoolman-cfs-sync/0.1"}
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = UrlRequest(url, data=data, headers=headers, method=method.upper())
+    try:
+        with urlopen(req, timeout=float(scfg.get("timeout_sec", 5) or 5)) as r:
+            raw = r.read().decode("utf-8", errors="replace")
+        return json.loads(raw) if raw.strip() else {}
+    except (socket.timeout, TimeoutError) as e:
+        raise SpoolmanTimeoutError(str(e) or "Spoolman request timed out") from e
+    except HTTPError as e:
+        try:
+            body = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            body = ""
+        raise SpoolmanHttpError(int(e.code or 0), body or str(e)) from e
+    except URLError as e:
+        reason = getattr(e, "reason", "")
+        if isinstance(reason, socket.timeout):
+            raise SpoolmanTimeoutError(str(reason) or "Spoolman request timed out") from e
+        raise SpoolmanHttpError(0, str(reason or e)) from e
+
+
+def _spoolman_health(cfg: Optional[dict] = None) -> dict:
+    return _spoolman_request_json("/health", cfg=cfg)
+
+
+def _spoolman_get_spool(spool_id: int, cfg: Optional[dict] = None) -> dict:
+    return _spoolman_request_json(f"/spool/{int(spool_id)}", cfg=cfg)
+
+
+def _spoolman_list_spools(cfg: Optional[dict] = None) -> list:
+    data = _spoolman_request_json("/spool", cfg=cfg)
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        for key in ("items", "results", "spools", "data"):
+            val = data.get(key)
+            if isinstance(val, list):
+                return val
+    return []
+
+
+def _spoolman_use_spool(spool_id: int, used_mm: float, cfg: Optional[dict] = None) -> dict:
+    return _spoolman_request_json(
+        f"/spool/{int(spool_id)}/use",
+        method="PUT",
+        payload={"use_length": float(max(0.0, used_mm))},
+        cfg=cfg,
+    )
+
+
+def _set_spoolman_status(state: AppState, **updates) -> None:
+    status = dict(getattr(state, "spoolman_status", {}) or {})
+    merged = _default_spoolman_status()
+    merged.update(status)
+    merged.update(updates)
+    state.spoolman_status = merged
+
+
+def _mark_spoolman_use_uncertain(state: AppState, record: dict, spool_id: int, reason: str) -> None:
+    record["status"] = "timeout_uncertain"
+    record["error"] = (
+        "Spoolman usage request result is uncertain. Spoolman may already have "
+        f"deducted this usage from spool {spool_id}. Verify Spoolman inventory before retrying. {reason}"
+    )
+    _set_spoolman_status(state, connected=False, last_check_at=_now(), last_error=record["error"])
+
+
+def _record_usage_matches(existing: dict, used_mm: float, used_g: float, spool_id: Optional[int]) -> bool:
+    try:
+        return (
+            abs(float(existing.get("used_mm") or 0.0) - float(used_mm or 0.0)) < 0.001
+            and abs(float(existing.get("used_g") or 0.0) - float(used_g or 0.0)) < 0.001
+        )
+    except Exception:
+        return False
+
+
+def _base_spoolman_record(
+    *,
+    job_key: str,
+    job_name: str,
+    slot_id: str,
+    spool_id: Optional[int],
+    used_mm: float,
+    used_g: float,
+    result: str,
+    status: str = "pending",
+    error: str = "",
+) -> dict:
+    now = _now()
+    return {
+        "job_key": job_key,
+        "job": job_name,
+        "slot": slot_id,
+        "spool_id": int(spool_id) if spool_id else None,
+        "used_mm": float(round(float(used_mm or 0.0), 3)),
+        "used_g": float(round(float(used_g or 0.0), 3)),
+        "result": result,
+        "status": status,
+        "attempts": 0,
+        "last_attempt_at": 0.0,
+        "synced_at": None,
+        "created_at": now,
+        "updated_at": now,
+        "error": error,
+    }
+
+
+def _save_spoolman_record(state: AppState, key: str, record: dict) -> None:
+    record["updated_at"] = _now()
+    records = dict(getattr(state, "spoolman_sync_records", {}) or {})
+    records[key] = record
+    state.spoolman_sync_records = records
+    save_state(state)
+
+
+def _spoolman_sync_record(state: AppState, key: str, record: dict, cfg: dict) -> dict:
+    existing = (getattr(state, "spoolman_sync_records", {}) or {}).get(key)
+    if isinstance(existing, dict):
+        existing_status = str(existing.get("status") or "")
+        if existing_status == "synced":
+            return existing
+        if existing_status == "timeout_uncertain":
+            return existing
+        if not _record_usage_matches(existing, record["used_mm"], record["used_g"], record.get("spool_id")):
+            conflict = dict(existing)
+            conflict["status"] = "conflict"
+            conflict["error"] = "Existing sync record has different usage; refusing to resend."
+            _save_spoolman_record(state, key, conflict)
+            return conflict
+        record["attempts"] = int(existing.get("attempts") or 0)
+        record["created_at"] = existing.get("created_at") or record.get("created_at")
+
+    spool_id = record.get("spool_id")
+    if not spool_id:
+        record["status"] = "skipped_unmapped"
+        record["error"] = "No Spoolman spool id is mapped for this CFS slot."
+        _save_spoolman_record(state, key, record)
+        return record
+
+    if bool(cfg.get("dry_run", True)):
+        record["status"] = "dry_run"
+        record["error"] = ""
+        _save_spoolman_record(state, key, record)
+        return record
+
+    if not bool(cfg.get("enabled", False)):
+        record["status"] = "pending"
+        record["error"] = "Spoolman sync is disabled."
+        _save_spoolman_record(state, key, record)
+        return record
+
+    record["status"] = "pending"
+    record["attempts"] = int(record.get("attempts") or 0) + 1
+    record["last_attempt_at"] = _now()
+    _save_spoolman_record(state, key, record)
+
+    try:
+        _spoolman_get_spool(int(spool_id), cfg)
+        _set_spoolman_status(state, connected=True, last_check_at=_now(), last_error="")
+    except SpoolmanHttpError as e:
+        if e.status_code == 404:
+            record["status"] = "skipped_invalid_spool"
+            record["error"] = f"Spoolman spool id {spool_id} was not found."
+        else:
+            record["status"] = "failed"
+            record["error"] = str(e)
+            _set_spoolman_status(state, connected=False, last_check_at=_now(), last_error=str(e))
+        _save_spoolman_record(state, key, record)
+        return record
+    except Exception as e:
+        record["status"] = "failed"
+        record["error"] = str(e)
+        _set_spoolman_status(state, connected=False, last_check_at=_now(), last_error=str(e))
+        _save_spoolman_record(state, key, record)
+        return record
+
+    try:
+        _spoolman_use_spool(int(spool_id), float(record.get("used_mm") or 0.0), cfg)
+        record["status"] = "synced"
+        record["synced_at"] = _now()
+        record["error"] = ""
+        _set_spoolman_status(state, connected=True, last_check_at=_now(), last_error="")
+    except SpoolmanTimeoutError as e:
+        _mark_spoolman_use_uncertain(state, record, int(spool_id), str(e) or "Request timed out.")
+    except SpoolmanHttpError as e:
+        if e.status_code and 400 <= int(e.status_code) < 500 and int(e.status_code) != 408:
+            record["status"] = "failed"
+            record["error"] = str(e)
+            _set_spoolman_status(state, connected=False, last_check_at=_now(), last_error=str(e))
+        else:
+            _mark_spoolman_use_uncertain(
+                state,
+                record,
+                int(spool_id),
+                f"HTTP status {e.status_code}: {e}",
+            )
+    except Exception as e:
+        _mark_spoolman_use_uncertain(state, record, int(spool_id), str(e))
+
+    _save_spoolman_record(state, key, record)
+    return record
+
+
+def _plan_spoolman_sync_for_finished_job(
+    state: AppState,
+    job_name: str,
+    start_ts: float,
+    end_ts: float,
+    result: str,
+    job_id: Optional[str] = None,
+) -> None:
+    cfg = _normalize_spoolman_config(load_config())
+    if not (bool(cfg.get("dry_run", True)) or bool(cfg.get("enabled", False))):
+        return
+
+    slot_mm = getattr(state, "job_track_slot_mm", {}) if isinstance(getattr(state, "job_track_slot_mm", {}), dict) else {}
+    slot_g = getattr(state, "job_track_slot_g", {}) if isinstance(getattr(state, "job_track_slot_g", {}), dict) else {}
+    mappings = cfg.get("slot_mappings") if isinstance(cfg.get("slot_mappings"), dict) else {}
+    job_key = _stable_print_key(job_name, start_ts, end_ts, job_id=job_id)
+
+    for sid, mm_val in slot_mm.items():
+        sid_s = str(sid).strip().upper()
+        try:
+            used_mm = float(mm_val or 0.0)
+        except Exception:
+            used_mm = 0.0
+        if used_mm <= 0:
+            continue
+        try:
+            used_g = float(slot_g.get(sid_s, 0.0) or 0.0)
+        except Exception:
+            used_g = 0.0
+        if used_g <= 0:
+            try:
+                mat = state.slots.get(sid_s).material if sid_s in state.slots else "OTHER"
+                used_g = float(mm_to_g(str(mat), used_mm))
+            except Exception:
+                used_g = 0.0
+
+        spool_id = mappings.get(sid_s)
+        record = _base_spoolman_record(
+            job_key=job_key,
+            job_name=job_name,
+            slot_id=sid_s,
+            spool_id=spool_id,
+            used_mm=used_mm,
+            used_g=used_g,
+            result=result,
+        )
+        _spoolman_sync_record(state, _spoolman_record_key(job_key, sid_s), record, cfg)
+
+
+def _update_spoolman_config(update: dict) -> dict:
+    cfg = load_config()
+    if not isinstance(cfg, dict):
+        cfg = {}
+    spool_cfg = _normalize_spoolman_config(cfg)
+    raw = cfg.get("spoolman") if isinstance(cfg.get("spoolman"), dict) else {}
+    raw = dict(raw)
+    raw.update(spool_cfg)
+    for key in ("enabled", "dry_run", "url", "timeout_sec"):
+        if key in update and update[key] is not None:
+            raw[key] = update[key]
+    cfg["spoolman"] = _normalize_spoolman_config({"spoolman": raw})
+    CONFIG_PATH.write_text(json.dumps(cfg, indent=2, ensure_ascii=False))
+    return _normalize_spoolman_config(cfg)
+
+
+def _update_printer_config(update: dict) -> dict:
+    cfg = load_config()
+    if not isinstance(cfg, dict):
+        cfg = {}
+    raw = dict(cfg)
+    for key in ("moonraker_url", "poll_interval_sec", "filament_diameter_mm", "cfs_autosync"):
+        if key in update and update[key] is not None:
+            raw[key] = update[key]
+    normalized = _normalize_printer_config(raw)
+    cfg.update(normalized)
+    cfg.setdefault("spoolman", _default_spoolman_config())
+    CONFIG_PATH.write_text(json.dumps(cfg, indent=2, ensure_ascii=False))
+    return normalized
+
+
+def _update_spoolman_mapping(slot_id: str, spool_id: Optional[int]) -> dict:
+    cfg = load_config()
+    spool_cfg = _normalize_spoolman_config(cfg)
+    mappings = dict(spool_cfg.get("slot_mappings") or {})
+    sid = str(slot_id or "").strip().upper()
+    if sid not in mappings:
+        raise HTTPException(status_code=404, detail="Unknown slot")
+    mappings[sid] = int(spool_id) if spool_id else None
+    raw = cfg.get("spoolman") if isinstance(cfg.get("spoolman"), dict) else {}
+    raw = dict(raw)
+    raw["slot_mappings"] = mappings
+    cfg["spoolman"] = _normalize_spoolman_config({"spoolman": raw})
+    CONFIG_PATH.write_text(json.dumps(cfg, indent=2, ensure_ascii=False))
+    return _normalize_spoolman_config(cfg)
+
+
 def _moonraker_fetch_history(base: str, limit: int = 20) -> list[dict]:
     """Fetch Moonraker job history list (best effort).
 
@@ -527,7 +1266,7 @@ def _moonraker_build_url(base: str, objects: list[str]) -> str:
     isn't consistently supported on Creality firmware. For maximum compatibility
     we use the ampersand form.
     """
-    safe = [str(o).strip() for o in (objects or []) if str(o).strip()]
+    safe = [quote(str(o).strip(), safe="") for o in (objects or []) if str(o).strip()]
     qs = "&".join(safe)
     return base.rstrip("/") + "/printer/objects/query?" + qs
 
@@ -535,6 +1274,32 @@ def _moonraker_build_url(base: str, objects: list[str]) -> str:
 def _moonraker_list_objects(base: str) -> list[str]:
     data = _http_get_json(base.rstrip("/") + "/printer/objects/list")
     return list((((data or {}).get("result") or {}).get("objects") or []))
+
+
+def _moonraker_detect_native_spoolman(base: str) -> tuple[bool, str]:
+    """Best-effort detection of Moonraker's native Spoolman component."""
+    warning = (
+        "Moonraker Spoolman integration detected. This may cause double-accounting "
+        "if Moonraker and spoolman-cfs-sync both deduct filament usage."
+    )
+    try:
+        info = _http_get_json(base.rstrip("/") + "/server/info", timeout=2.5)
+        result = (info or {}).get("result") or {}
+        comps = result.get("components")
+        if isinstance(comps, list) and any(str(c).lower() == "spoolman" for c in comps):
+            return True, warning
+    except Exception:
+        pass
+
+    try:
+        cfg = _http_get_json(base.rstrip("/") + "/server/config", timeout=2.5)
+        raw = json.dumps(cfg or {}).lower()
+        if '"spoolman"' in raw or "[spoolman]" in raw:
+            return True, warning
+    except Exception:
+        pass
+
+    return False, ""
 
 
 def _walk(obj, path=""):
@@ -770,6 +1535,8 @@ async def moonraker_poll_loop() -> None:
     poll_objects = base_objects + cfs_objects
     url = _moonraker_build_url(base, poll_objects)
 
+    native_spoolman_detected, native_spoolman_warning = await asyncio.to_thread(_moonraker_detect_native_spoolman, base)
+
     # Optional: if enabled, we import material/color/name from CFS objects into our local slots.
     cfs_autosync = bool(cfg.get("cfs_autosync", False))
 
@@ -789,11 +1556,20 @@ async def moonraker_poll_loop() -> None:
             filename = ps.get("filename") or vsd.get("file_path") or ""
             if isinstance(filename, str) and "/" in filename:
                 filename = filename.rsplit("/", 1)[-1]
+            job_id = _moonraker_current_job_id(ps, vsd)
             used = ps.get("filament_used")
             if used is None:
                 used_mm = 0
             else:
                 used_mm = int(float(used))
+            try:
+                file_position = int(float(vsd.get("file_position") or 0))
+            except Exception:
+                file_position = 0
+            try:
+                file_size = int(float(vsd.get("file_size") or 0))
+            except Exception:
+                file_size = 0
 
             used_g = 0.0
             try:
@@ -807,6 +1583,12 @@ async def moonraker_poll_loop() -> None:
             st = load_state()
             st.printer_connected = True
             st.printer_last_error = ""
+            _set_spoolman_status(
+                st,
+                dry_run=bool(_normalize_spoolman_config(load_config()).get("dry_run", True)),
+                moonraker_native_detected=bool(native_spoolman_detected),
+                moonraker_native_warning=native_spoolman_warning,
+            )
 
             # --- CFS read-only extraction (best effort) ---
             cfs_status = {k: v for k, v in (status or {}).items() if k not in ("print_stats", "virtual_sdcard")}
@@ -859,41 +1641,53 @@ async def moonraker_poll_loop() -> None:
                 if is_printing and filename:
                     if (not tracking) or (st.job_track_name != filename):
                         st.job_track_name = filename
+                        st.job_track_id = job_id
                         st.job_track_started_at = _now()
                         st.job_track_last_mm = 0
                         st.job_track_slot_mm = {}
                         st.job_track_slot_g = {}
                         st.job_track_last_state = ps_state
+                        st.job_track_file_path = ""
+                        st.job_track_last_file_position = 0
+                        st.job_track_file_size = 0
+                        st.job_track_extruder_mode = "relative"
+                        st.job_track_last_e = 0.0
+                        st.job_track_parser_slot = curr_slot
+                        st.job_track_parser_tail = ""
+                    elif job_id and not str(getattr(st, "job_track_id", "") or "").strip():
+                        st.job_track_id = job_id
 
-                    # Attribute delta to current slot
-                    last_mm = int(st.job_track_last_mm or 0)
-                    delta_mm = max(0, int(used_mm) - last_mm)
-                    if delta_mm > 0 and curr_slot:
-                        st.job_track_slot_mm[curr_slot] = int(st.job_track_slot_mm.get(curr_slot, 0)) + int(delta_mm)
+                    if file_size > 0:
+                        st.job_track_file_size = max(int(st.job_track_file_size or 0), file_size)
 
-                        # Convert delta_mm to grams for this slot's material and track it
+                    # Attribute executed G-code extrusion to slots. Creality's
+                    # print_stats.filament_used follows the live E position and
+                    # can move backwards during retractions/tool changes, so it
+                    # is not safe as an accumulated counter.
+                    if file_position > 0 and curr_slot:
                         try:
-                            mat = st.slots.get(curr_slot).material if curr_slot in st.slots else "OTHER"
-                            g_delta = float(mm_to_g(str(mat), float(delta_mm)))
-                        except Exception:
-                            g_delta = 0.0
-                        if g_delta > 0:
-                            st.job_track_slot_g[curr_slot] = float(st.job_track_slot_g.get(curr_slot, 0.0)) + float(g_delta)
-
-                            # Live spool deduction: increment epoch-consumed total immediately
-                            _inc_slot_epoch_consumed(st, curr_slot, float(g_delta))
-                    st.job_track_last_mm = int(used_mm)
+                            _track_usage_from_gcode_file(
+                                st,
+                                base_url=base,
+                                filename=filename,
+                                virtual_sdcard=vsd,
+                                file_position=file_position,
+                                fallback_slot=curr_slot,
+                            )
+                        except Exception as e:
+                            _set_spoolman_status(st, last_error=f"G-code usage parser failed: {e}")
+                    st.job_track_last_mm = _job_track_total_mm(st)
                     st.job_track_last_state = ps_state
 
                     # Publish a single "live" history entry per slot for the current job.
-                    # This makes the right-hand "Historie pro Slot" useful during
+                    # This makes the right-hand "History by Slot" useful during
                     # multi-color prints (usage is attributed while printing, not only at the end).
                     try:
                         now_ts = _now()
                         slot_mm_live = st.job_track_slot_mm if isinstance(st.job_track_slot_mm, dict) else {}
                         for sid, mm_live in slot_mm_live.items():
                             try:
-                                mm_i = int(mm_live or 0)
+                                mm_i = int(round(float(mm_live or 0)))
                                 if mm_i <= 0:
                                     continue
                                 mat = st.slots.get(sid).material if sid in st.slots else "OTHER"
@@ -918,6 +1712,16 @@ async def moonraker_poll_loop() -> None:
 
                 # Finalize when printing ends (complete/cancel/error/standby)
                 if (not is_printing) and tracking and st.job_track_name:
+                    try:
+                        _finish_gcode_usage_tracking(
+                            st,
+                            base_url=base,
+                            fallback_slot=curr_slot,
+                            completed=ps_state in ("complete", "completed"),
+                        )
+                    except Exception as e:
+                        _set_spoolman_status(st, last_error=f"G-code usage finalization failed: {e}")
+
                     # Determine an end timestamp from Creality virtual_sdcard if available
                     end_ts = _now()
                     try:
@@ -932,7 +1736,7 @@ async def moonraker_poll_loop() -> None:
                     slot_mm = st.job_track_slot_mm if isinstance(st.job_track_slot_mm, dict) else {}
                     for sid, mm in slot_mm.items():
                         try:
-                            mm_i = int(mm)
+                            mm_i = int(round(float(mm)))
                             if mm_i <= 0:
                                 continue
                             mat = st.slots.get(sid).material if sid in st.slots else "OTHER"
@@ -961,19 +1765,40 @@ async def moonraker_poll_loop() -> None:
                         except Exception:
                             continue
 
+                    try:
+                        _plan_spoolman_sync_for_finished_job(
+                            st,
+                            st.job_track_name,
+                            float(st.job_track_started_at or 0.0),
+                            float(end_ts),
+                            ps_state,
+                            str(getattr(st, "job_track_id", "") or ""),
+                        )
+                    except Exception as e:
+                        _set_spoolman_status(st, last_error=f"Spoolman sync planning failed: {e}")
+
                     # Reset tracking
                     st.job_track_name = ""
+                    st.job_track_id = ""
                     st.job_track_started_at = 0.0
                     st.job_track_last_mm = 0
                     st.job_track_slot_mm = {}
                     st.job_track_slot_g = {}
                     st.job_track_last_state = ps_state
+                    st.job_track_file_path = ""
+                    st.job_track_last_file_position = 0
+                    st.job_track_file_size = 0
+                    st.job_track_extruder_mode = "relative"
+                    st.job_track_last_e = 0.0
+                    st.job_track_parser_slot = ""
+                    st.job_track_parser_tail = ""
             except Exception:
                 pass
 
             # --- Job usage accounting ---
             if filename or used_mm:
-                _apply_job_usage(st, filename or st.current_job or "", used_mm)
+                display_used_mm = _job_track_total_mm(st) if st.job_track_name else used_mm
+                _apply_job_usage(st, filename or st.current_job or "", display_used_mm)
                 if used_g > 0.0:
                     st.current_job_filament_g = float(round(used_g, 2))
 
@@ -1002,8 +1827,22 @@ async def moonraker_poll_loop() -> None:
         await asyncio.sleep(interval)
 
 
+async def _restart_moonraker_poll_task() -> None:
+    global MOONRAKER_POLL_TASK
+    if MOONRAKER_POLL_TASK and not MOONRAKER_POLL_TASK.done():
+        MOONRAKER_POLL_TASK.cancel()
+        try:
+            await MOONRAKER_POLL_TASK
+        except asyncio.CancelledError:
+            pass
+    MOONRAKER_POLL_TASK = None
+    cfg = load_config()
+    if (cfg.get("moonraker_url") or "").strip():
+        MOONRAKER_POLL_TASK = asyncio.create_task(moonraker_poll_loop())
 
-app = FastAPI(title="3D Drucker Filament Manager", version="0.1.1")
+
+
+app = FastAPI(title="3D Printer Filament Manager", version="0.1.1")
 
 
 @app.middleware("http")
@@ -1029,9 +1868,7 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 @app.on_event("startup")
 async def _startup():
     _ensure_data_files()
-    cfg = load_config()
-    if (cfg.get("moonraker_url") or "").strip():
-        asyncio.create_task(moonraker_poll_loop())
+    await _restart_moonraker_poll_task()
 
 
 @app.get("/")
@@ -1137,7 +1974,7 @@ def _ui_state_dict(state: AppState) -> dict:
 
         # Derived spool metrics (purely local)
         # - spool_consumed_g: running total for current epoch (stable even if UI history is trimmed)
-        # - spool_used_g: consumption since the last "Übernehmen" reference
+        # - spool_used_g: consumption since the last "Apply" reference
         # - spool_remaining_g: computed remaining weight
         try:
             consumed = float(out.get("spool_epoch_consumed_g_total") or 0.0)
@@ -1171,6 +2008,10 @@ def _ui_state_dict(state: AppState) -> dict:
     d.setdefault("cfs_active_slot", None)
     d.setdefault("cfs_slots", {})
     d.setdefault("cfs_raw", {})
+    d.setdefault("spoolman_status", _default_spoolman_status())
+    d.setdefault("spoolman_sync_records", {})
+    d["printer_config"] = _printer_public_config()
+    d["spoolman_config"] = _spoolman_public_config()
 
     return d
 
@@ -1183,10 +2024,170 @@ def _slot_consumed_g_epoch(state: AppState, slot: str) -> float:
         return 0.0
 
 
+def _clear_local_accounting(state: AppState) -> AppState:
+    if str(getattr(state, "job_track_name", "") or "").strip():
+        raise HTTPException(status_code=409, detail="Cannot clear local accounting while a print is being tracked.")
+
+    state.slot_history = {}
+    state.moonraker_allocations = {}
+    state.spoolman_sync_records = {}
+
+    state.current_job = ""
+    state.current_job_filament_mm = 0
+    state.current_job_filament_g = 0.0
+    state.last_accounted_job_mm = 0
+    state.last_accounted_slot = None
+
+    state.job_track_name = ""
+    state.job_track_id = ""
+    state.job_track_started_at = 0.0
+    state.job_track_last_mm = 0
+    state.job_track_slot_mm = {}
+    state.job_track_slot_g = {}
+    state.job_track_last_state = ""
+    state.job_track_file_path = ""
+    state.job_track_last_file_position = 0
+    state.job_track_file_size = 0
+    state.job_track_extruder_mode = "relative"
+    state.job_track_last_e = 0.0
+    state.job_track_parser_slot = ""
+    state.job_track_parser_tail = ""
+
+    for sid, slot in list((state.slots or {}).items()):
+        try:
+            slot.spool_epoch_consumed_g_total = 0.0
+            if slot.spool_ref_consumed_g is not None:
+                slot.spool_ref_consumed_g = 0.0
+            state.slots[sid] = slot
+        except Exception:
+            continue
+
+    save_state(state)
+    return state
+
+
 # --- UI API (static frontend uses /api/ui/* and expects {"result": ...}) ---
 @app.get("/api/ui/state", response_model=ApiResponse)
 def api_ui_state() -> ApiResponse:
     return ApiResponse(result=_ui_state_dict(load_state()))
+
+
+@app.post("/api/ui/printer/config", response_model=ApiResponse)
+async def api_ui_printer_config(req: UiPrinterConfigRequest) -> ApiResponse:
+    update = _req_dump(req, exclude_unset=True)
+    _update_printer_config(update)
+    await _restart_moonraker_poll_task()
+    return ApiResponse(result=_ui_state_dict(load_state()))
+
+
+@app.get("/api/ui/spoolman/status", response_model=ApiResponse)
+def api_ui_spoolman_status() -> ApiResponse:
+    st = load_state()
+    payload = {
+        "config": _spoolman_public_config(),
+        "status": st.spoolman_status,
+        "records": st.spoolman_sync_records,
+    }
+    return ApiResponse(result=payload)
+
+
+@app.post("/api/ui/spoolman/config", response_model=ApiResponse)
+def api_ui_spoolman_config(req: UiSpoolmanConfigRequest) -> ApiResponse:
+    update = _req_dump(req, exclude_unset=True)
+    cfg = _update_spoolman_config(update)
+    st = load_state()
+    _set_spoolman_status(st, dry_run=bool(cfg.get("dry_run", True)))
+    save_state(st)
+    return ApiResponse(result=_ui_state_dict(st))
+
+
+@app.post("/api/ui/spoolman/mapping", response_model=ApiResponse)
+def api_ui_spoolman_mapping(req: UiSpoolmanMappingRequest) -> ApiResponse:
+    _update_spoolman_mapping(req.slot, req.spool_id)
+    return ApiResponse(result=_ui_state_dict(load_state()))
+
+
+@app.post("/api/ui/spoolman/test", response_model=ApiResponse)
+def api_ui_spoolman_test() -> ApiResponse:
+    st = load_state()
+    cfg = _normalize_spoolman_config(load_config())
+    try:
+        _spoolman_health(cfg)
+        _set_spoolman_status(
+            st,
+            connected=True,
+            last_check_at=_now(),
+            last_error="",
+            dry_run=bool(cfg.get("dry_run", True)),
+        )
+    except Exception as e:
+        _set_spoolman_status(
+            st,
+            connected=False,
+            last_check_at=_now(),
+            last_error=str(e),
+            dry_run=bool(cfg.get("dry_run", True)),
+        )
+    save_state(st)
+    return ApiResponse(result=_ui_state_dict(st))
+
+
+@app.get("/api/ui/spoolman/spools", response_model=ApiResponse)
+def api_ui_spoolman_spools() -> ApiResponse:
+    st = load_state()
+    cfg = _normalize_spoolman_config(load_config())
+    try:
+        spools = _spoolman_list_spools(cfg)
+        _set_spoolman_status(
+            st,
+            connected=True,
+            last_check_at=_now(),
+            last_error="",
+            dry_run=bool(cfg.get("dry_run", True)),
+        )
+        save_state(st)
+        return ApiResponse(result={"spools": spools, "status": st.spoolman_status})
+    except Exception as e:
+        _set_spoolman_status(
+            st,
+            connected=False,
+            last_check_at=_now(),
+            last_error=str(e),
+            dry_run=bool(cfg.get("dry_run", True)),
+        )
+        save_state(st)
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@app.post("/api/ui/spoolman/retry", response_model=ApiResponse)
+def api_ui_spoolman_retry(req: UiSpoolmanRetryRequest) -> ApiResponse:
+    st = load_state()
+    key = (req.record_key or "").strip()
+    rec = (st.spoolman_sync_records or {}).get(key)
+    if not isinstance(rec, dict):
+        raise HTTPException(status_code=404, detail="Unknown Spoolman sync record")
+    status = str(rec.get("status") or "")
+    if status == "timeout_uncertain":
+        raise HTTPException(
+            status_code=409,
+            detail="Timeout-uncertain records are not automatically retryable. Verify Spoolman inventory first.",
+        )
+    if status not in ("failed", "pending", "skipped_invalid_spool", "skipped_unmapped", "dry_run"):
+        raise HTTPException(status_code=409, detail=f"Record with status {status!r} cannot be retried")
+    cfg = _normalize_spoolman_config(load_config())
+    retry_record = dict(rec)
+    sid = str(retry_record.get("slot") or "").strip().upper()
+    mappings = cfg.get("slot_mappings") if isinstance(cfg.get("slot_mappings"), dict) else {}
+    if sid in mappings:
+        retry_record["spool_id"] = mappings.get(sid)
+    _spoolman_sync_record(st, key, retry_record, cfg)
+    return ApiResponse(result=_ui_state_dict(load_state()))
+
+
+@app.post("/api/ui/accounting/clear", response_model=ApiResponse)
+def api_ui_accounting_clear() -> ApiResponse:
+    st = _clear_local_accounting(load_state())
+    return ApiResponse(result=_ui_state_dict(st))
 
 
 @app.post("/api/ui/moonraker/allocate", response_model=ApiResponse)
@@ -1318,7 +2319,7 @@ def api_ui_spool_set_start(req: UiSpoolSetStartRequest) -> ApiResponse:
 
 @app.post("/api/ui/spool/set_remaining", response_model=ApiResponse)
 def api_ui_spool_set_remaining(req: UiSpoolSetRemainingRequest) -> ApiResponse:
-    """Übernehmen: set measured remaining weight as new reference (local only).
+    """Apply measured remaining weight as the new reference (local only).
 
     Does NOT reset epoch and does not delete history. Remaining is computed as:
       remaining = ref_remaining - (consumed_epoch - ref_consumed)
@@ -1436,11 +2437,11 @@ def api_ui_retract(req: RetractRequest) -> ApiResponse:
 @app.get("/api/ui/help", response_model=ApiResponse)
 def api_ui_help() -> ApiResponse:
     text = (
-        "Klick einen Slot, um ihn aktiv zu setzen.\n"
-        "Mit den Farb-Presets setzt du die Farbe auf den aktiven Slot.\n"
-        "Zuführ/Zurückziehen sind aktuell Adapter-Hooks (Dummy), bis wir echte Hardware anbinden.\n"
-        "Job-Verbrauch: Wenn du Moonraker nutzt, trage moonraker_url in data/config.json ein, dann wird der Job + filament_used automatisch übernommen.\n"
-        "Alternativ kannst du manuell /api/ui/job/update nutzen."
+        "Click a slot to open its local spool editor.\n"
+        "Color and material data are read from CFS when available.\n"
+        "Feed/retract actions are adapter hooks for future hardware integration.\n"
+        "Job usage: when Moonraker is configured in data/config.json, job and filament_used values are imported automatically.\n"
+        "Alternatively, you can update usage manually through /api/ui/job/update."
     )
     return ApiResponse(result={"text": text})
 
@@ -1462,13 +2463,13 @@ def default_state() -> AppState:
     for sid in DEFAULT_SLOTS:
         slots[sid] = SlotState(slot=sid, material="OTHER", color_hex="#00aaff", remaining_g=0.0)
 
-    # Sensible demo defaults for Box 2 (matches the UI screenshot vibe)
-    slots["2A"].material = "ABS"
-    slots["2A"].color_hex = "#4b0082"  # indigo-ish
-    slots["2A"].remaining_g = 1000.0
+    # Sensible demo defaults for a single CFS box.
+    slots["1A"].material = "ABS"
+    slots["1A"].color_hex = "#4b0082"  # indigo-ish
+    slots["1A"].remaining_g = 1000.0
 
     return AppState(
-        active_slot="2A",
+        active_slot="1A",
         auto_mode=False,
         updated_at=_now(),
         slots=slots,  # type: ignore[arg-type]
@@ -1482,4 +2483,6 @@ def default_state() -> AppState:
         cfs_active_slot=None,
         cfs_slots={},
         cfs_raw={},
+        spoolman_status=_default_spoolman_status(),
+        spoolman_sync_records={},
     )

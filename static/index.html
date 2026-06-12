@@ -1,24 +1,25 @@
-<!doctype html>
-<html lang="de">
+﻿<!doctype html>
+<html lang="en">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Filament Anzeige (K2 Plus / CFS)</title>
+    <title>Filament Monitor (K2 Plus / CFS)</title>
     <link rel="stylesheet" href="/static/style.css" />
   </head>
   <body>
     <header class="topbar">
       <div class="brand">
-        <div class="logo">🧵</div>
+        <div class="logo">FM</div>
         <div>
-          <div class="title">Filament Anzeige</div>
-          <div class="subtitle">&copy; bei jkef 2026</div>
+          <div class="title">Filament Monitor</div>
+          <div class="subtitle">&copy; jkef 2026</div>
         </div>
       </div>
 
       <div class="badges">
-        <div id="printerBadge" class="badge">Printer: —</div>
-        <div id="cfsBadge" class="badge">CFS: —</div>
+        <div id="printerBadge" class="badge">Printer: -</div>
+        <div id="cfsBadge" class="badge">CFS: -</div>
+        <button id="settingsOpen" class="settingsBtn" type="button">Settings</button>
       </div>
     </header>
 
@@ -29,37 +30,46 @@
 
           <section class="card" style="margin-top: 16px;">
             <div class="cardHead">
-              <div class="cardTitle">Aktiv</div>
-              <div id="activeMeta" class="cardMeta">—</div>
+              <div class="cardTitle">Active Slot</div>
+              <div id="activeMeta" class="cardMeta">-</div>
             </div>
             <div class="activeRow" id="activeRow"></div>
             <div id="activeLive" class="activeLive" style="display:none;"></div>
+          </section>
+
+          <section class="card" id="spoolmanCard" style="margin-top: 16px;">
+            <div class="cardHead">
+              <div class="cardTitle">Spoolman Sync</div>
+              <div id="spoolmanMeta" class="cardMeta">-</div>
+            </div>
+            <div class="spoolmanPanel" id="spoolmanPanel"></div>
           </section>
         </div>
 
         <aside class="rightCol">
           <section class="card" id="historyCard">
             <div class="cardHead">
-              <div class="cardTitle">Historie pro Slot</div>
+              <div class="cardTitle">History by Slot</div>
               <div class="cardMeta">
-                <span class="tag muted">letzte 4</span>
+                <span class="tag muted">latest 4</span>
+                <button id="clearAccountingBtn" class="btn mini danger" type="button">Clear Test Data</button>
                 <div class="refreshCtl">
-                  <label class="refreshLbl" for="refreshSelect">⟳</label>
-                  <select id="refreshSelect" class="refreshSel" title="Update-Intervall">
+                  <label class="refreshLbl" for="refreshSelect">Refresh</label>
+                  <select id="refreshSelect" class="refreshSel" title="Refresh interval">
                     <option value="2000">2s</option>
                     <option value="5000">5s</option>
                     <option value="10000">10s</option>
                     <option value="15000">15s</option>
                     <option value="30000">30s</option>
                   </select>
-                  <button id="refreshToggle" class="refreshBtn" title="Auto-Update an/aus">⏸</button>
+                  <button id="refreshToggle" class="refreshBtn" title="Toggle auto-refresh">Pause</button>
                 </div>
               </div>
             </div>
             <div class="history" id="slotHistory"></div>
 
             <details class="details" style="margin-top:12px;">
-              <summary>Moonraker-History (gesamt)</summary>
+              <summary>Moonraker History (all jobs)</summary>
               <div class="moonHist" id="moonHistory"></div>
             </details>
           </section>
@@ -67,12 +77,12 @@
       </div>
 
       <footer class="footer">
-        <span>Tip: Wenn Farben/Material nicht angezeigt werden, prüfe in <code>data/config.json</code> die <code>moonraker_url</code>.</span>
+        <span>Tip: If colors or materials are not shown, check <code>moonraker_url</code> in <code>data/config.json</code>.</span>
       </footer>
     </main>
 
     <!-- cache-bust: force clients to fetch latest app.js after updates -->
-    <script src="/static/app.js?v=20260225-2"></script>
+    <script src="/static/app.js?v=20260225-5"></script>
 
     <!-- Slot / Spool editor (local bookkeeping only; never talks to printer) -->
     <div id="spoolModal" class="modal" style="display:none;">
@@ -81,25 +91,84 @@
         <div class="modalHead">
           <div>
             <div class="modalTitle" id="spoolTitle">Slot</div>
-            <div class="modalSub" id="spoolSub">—</div>
+            <div class="modalSub" id="spoolSub">-</div>
           </div>
-          <button class="modalClose" id="spoolClose" title="Schließen">✕</button>
+          <button class="modalClose" id="spoolClose" title="Close">x</button>
         </div>
         <div class="modalBody">
           <div class="formRow">
-            <label>Istgewicht (g)</label>
-            <input id="spoolRemain" type="number" min="0" step="1" placeholder="z.B. 206" />
-            <button id="spoolSaveRemain" class="btn">Übernehmen</button>
+            <label>Current weight (g)</label>
+            <input id="spoolRemain" type="number" min="0" step="1" placeholder="e.g. 206" />
+            <button id="spoolSaveRemain" class="btn">Apply</button>
           </div>
           <div class="formRow">
-            <label>Neue Rolle (g)</label>
-            <input id="spoolStart" type="number" min="1" step="1" placeholder="z.B. 1000" />
-            <button id="spoolSaveStart" class="btn">Rollwechsel</button>
+            <label>New spool (g)</label>
+            <input id="spoolStart" type="number" min="1" step="1" placeholder="e.g. 1000" />
+            <button id="spoolSaveStart" class="btn">Change Spool</button>
           </div>
-          <div class="modalStats" id="spoolStats">—</div>
-          <div class="modalHint">Hinweis: Das speichert nur lokal in dieser App (kein POST an den Drucker). Rollwechsel versteckt alte Drucke in der Slot-Historie (bleibt intern gespeichert).</div>
+          <div class="modalStats" id="spoolStats">-</div>
+          <div class="modalHint">Note: This is saved locally in this app only. It does not send anything to the printer. Changing the spool hides older prints from the slot history, while keeping them stored internally.</div>
+        </div>
+      </div>
+    </div>
+
+    <div id="spoolmanPickerModal" class="modal" style="display:none;">
+      <div class="modalBackdrop" id="spoolmanPickerBackdrop"></div>
+      <div class="modalPanel spoolmanPickerPanel">
+        <div class="modalHead">
+          <div>
+            <div class="modalTitle" id="spoolmanPickerTitle">Select Spool</div>
+            <div class="modalSub" id="spoolmanPickerSub">-</div>
+          </div>
+          <button class="modalClose" id="spoolmanPickerClose" title="Close">x</button>
+        </div>
+        <div class="modalBody">
+          <input id="spoolmanPickerSearch" class="spoolmanPickerSearch" type="search" placeholder="Search filament, material, vendor, or spool id" />
+          <div id="spoolmanPickerStatus" class="spoolmanPickerStatus"></div>
+          <div id="spoolmanPickerList" class="spoolmanPickerList"></div>
+        </div>
+      </div>
+    </div>
+
+    <div id="settingsModal" class="modal" style="display:none;">
+      <div class="modalBackdrop" id="settingsBackdrop"></div>
+      <div class="modalPanel">
+        <div class="modalHead">
+          <div>
+            <div class="modalTitle">Printer / CFS Settings</div>
+            <div class="modalSub">Moonraker connection and local tracking options</div>
+          </div>
+          <button class="modalClose" id="settingsClose" title="Close">x</button>
+        </div>
+        <div class="modalBody">
+          <div class="formRow">
+            <label>Moonraker URL</label>
+            <input id="settingsMoonrakerUrl" type="url" placeholder="http://printer-ip:7125" />
+            <button id="settingsSave" class="btn">Save</button>
+          </div>
+          <div class="formRow">
+            <label>Poll interval (s)</label>
+            <input id="settingsPollInterval" type="number" min="1" max="60" step="1" />
+            <span></span>
+          </div>
+          <div class="formRow">
+            <label>Filament diameter (mm)</label>
+            <input id="settingsFilamentDiameter" type="number" min="0.5" max="5" step="0.01" />
+            <span></span>
+          </div>
+          <label class="settingsCheck">
+            <input id="settingsCfsAutosync" type="checkbox" />
+            Import CFS material, color, and name into local slots
+          </label>
+          <label class="settingsCheck">
+            <input id="settingsDebugMode" type="checkbox" />
+            Enable debug mode
+          </label>
+          <div id="settingsStatus" class="modalHint"></div>
         </div>
       </div>
     </div>
   </body>
 </html>
+
+

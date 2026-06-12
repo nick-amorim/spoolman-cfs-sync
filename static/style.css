@@ -189,7 +189,20 @@ body{
   border:1px solid rgba(29,42,58,.9);
   color: var(--text);
 }
+.settingsBtn{
+  font-size:12px;
+  padding:8px 10px;
+  border:1px solid var(--line);
+  background:rgba(255,255,255,.05);
+  color:var(--text);
+  border-radius:999px;
+  cursor:pointer;
+}
+.settingsBtn:hover{background:rgba(255,255,255,.09)}
 .tag.muted{color:var(--muted)}
+.tag.ok{border-color: rgba(31,157,85,.45);}
+.tag.warn{border-color: rgba(246,183,60,.45);}
+.tag.bad{border-color: rgba(214,69,69,.45);}
 
 .activeRow{padding:14px;display:flex;gap:12px;flex-wrap:wrap}
 
@@ -233,7 +246,7 @@ code{font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospa
 .assignActions{display:flex; align-items:center; gap:10px; flex-wrap:wrap;}
 
 /* When an entry is already assigned, keep UI compact.
-   User can click "Ändern" to reveal the assignment UI again. */
+   User can click "Edit" to reveal the assignment UI again. */
 .assignWrap.assigned .assignRows,
 .assignWrap.assigned .assignActions{display:none;}
 .btn.mini{padding:6px 10px; font-size:12px; border-radius:999px; align-self:flex-start;}
@@ -256,6 +269,48 @@ code{font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospa
 .histNums{font-size:12px;color:var(--text);white-space:nowrap;}
 .histSub{margin-top:6px;color:var(--muted);font-size:12px;display:flex;flex-wrap:wrap;gap:10px;}
 
+/* --- Spoolman sync panel --- */
+.spoolmanPanel{padding:14px;display:flex;flex-direction:column;gap:12px}
+.spoolmanStatus{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.spoolmanWarn{
+  border:1px solid rgba(246,183,60,.35);
+  background:rgba(246,183,60,.08);
+  color:rgba(255,232,180,.95);
+  border-radius:14px;
+  padding:10px 12px;
+  font-size:12px;
+  line-height:1.35;
+}
+.spoolmanConfig{display:grid;grid-template-columns:minmax(180px,1fr) auto auto auto auto;gap:8px;align-items:center}
+.spoolmanUrl{min-width:0;width:100%;padding:9px 10px;border-radius:12px;border:1px solid rgba(255,255,255,.10);background:rgba(10,16,24,0.55);color:rgba(255,255,255,.92)}
+.spoolmanCheck{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);white-space:nowrap}
+.spoolmanMappings{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
+.spoolmanMapRow{display:grid;grid-template-columns:36px minmax(0,1fr);gap:8px;border:1px solid rgba(29,42,58,.7);border-radius:14px;background:rgba(10,16,24,.42);padding:8px}
+.spoolmanSlot{font-size:12px;font-weight:800}
+.spoolmanSelected{font-size:12px;color:var(--text);display:flex;align-items:center;gap:8px;min-width:0;white-space:nowrap}
+.spoolmanSelectedSwatch{width:18px;height:18px;flex:0 0 18px;border-radius:999px;border:1px solid rgba(255,255,255,.22);box-shadow:inset 0 0 0 1px rgba(0,0,0,.18);background:#6b7280}
+.spoolmanSelectedSwatch.empty{background:transparent;border-style:dashed;opacity:.55}
+.spoolmanSelectedText{min-width:0;overflow:hidden;text-overflow:ellipsis}
+.spoolmanMapActions{grid-column:2;display:flex;flex-wrap:wrap;gap:6px;align-items:center;min-width:0}
+.spoolmanMapActions .btn.mini{align-self:center;white-space:nowrap}
+.spoolmanMapActions input{width:58px;min-width:0;padding:7px 8px;border-radius:10px;border:1px solid rgba(255,255,255,.10);background:rgba(0,0,0,.22);color:#fff}
+.spoolmanMapTag{white-space:nowrap}
+.spoolmanSubTitle{font-size:12px;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:.04em}
+.spoolmanRecords{display:flex;flex-direction:column;gap:8px}
+.spoolmanRecord{border:1px solid rgba(29,42,58,.7);border-radius:14px;background:rgba(10,16,24,.42);padding:9px 10px;display:flex;flex-direction:column;gap:4px}
+.spoolmanRecord.synced{border-color:rgba(31,157,85,.35)}
+.spoolmanRecord.dry_run{border-color:rgba(246,183,60,.32)}
+.spoolmanRecord.timeout_uncertain,.spoolmanRecord.conflict{border-color:rgba(246,183,60,.55);background:rgba(246,183,60,.07)}
+.spoolmanRecord.failed,.spoolmanRecord.skipped_invalid_spool{border-color:rgba(214,69,69,.35)}
+.spoolmanRecordMain{font-size:12px;font-weight:800}
+.spoolmanRecordSub{font-size:12px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.spoolmanRecordErr{font-size:12px;color:rgba(255,210,170,.95);line-height:1.35}
+@media (max-width:700px){
+  .spoolmanConfig{grid-template-columns:1fr}
+  .spoolmanMappings{grid-template-columns:1fr}
+  .spoolmanMapRow{grid-template-columns:32px minmax(0,1fr)}
+}
+
 /* --- Modal (Spool editor) --- */
 .modal{position:fixed;inset:0;z-index:50}
 .modalBackdrop{position:absolute;inset:0;background:rgba(0,0,0,.55)}
@@ -269,6 +324,44 @@ code{font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospa
 .formRow label{font-size:13px;opacity:.9}
 .formRow input{width:100%;padding:10px 12px;border-radius:12px;border:1px solid rgba(255,255,255,.12);background:rgba(0,0,0,.25);color:#fff}
 .btn{padding:10px 12px;border-radius:12px;border:1px solid rgba(255,255,255,.14);background:rgba(255,255,255,.06);color:#fff;cursor:pointer}
+.btn.danger{border-color:rgba(214,69,69,.35);background:rgba(214,69,69,.10);color:rgba(255,225,225,.95)}
+.btn:disabled{opacity:.45;cursor:not-allowed}
 .modalStats{margin-top:8px;padding:10px 12px;border-radius:12px;border:1px solid rgba(255,255,255,.08);background:rgba(0,0,0,.18);font-size:13px;line-height:1.45}
 .modalHint{margin-top:10px;font-size:12px;color:var(--muted)}
+.settingsCheck{display:flex;gap:8px;align-items:center;margin-top:8px;font-size:13px;color:rgba(255,255,255,.86)}
 @media (max-width:560px){.formRow{grid-template-columns:1fr}}
+
+/* --- Spoolman picker modal --- */
+.spoolmanPickerPanel{width:min(760px,calc(100% - 32px))}
+.spoolmanPickerSearch{width:100%;padding:11px 12px;border-radius:12px;border:1px solid rgba(255,255,255,.12);background:rgba(0,0,0,.25);color:#fff;margin-bottom:10px}
+.spoolmanPickerStatus{font-size:12px;color:var(--muted);margin-bottom:10px}
+.spoolmanPickerList{display:flex;flex-direction:column;gap:8px;max-height:min(58vh,560px);overflow:auto;padding-right:2px}
+.spoolmanPickerItem{
+  width:100%;
+  display:grid;
+  grid-template-columns:28px minmax(0,1fr) 70px 90px 92px;
+  align-items:center;
+  gap:10px;
+  border:1px solid rgba(29,42,58,.8);
+  border-radius:12px;
+  background:rgba(12,18,27,.72);
+  color:var(--text);
+  padding:9px 10px;
+  cursor:pointer;
+  text-align:left;
+}
+.spoolmanPickerItem:hover{border-color:rgba(255,255,255,.20);background:rgba(18,27,40,.86)}
+.spoolmanPickerSwatch{width:22px;height:22px;border-radius:999px;border:1px solid rgba(255,255,255,.22);box-shadow:inset 0 0 0 1px rgba(0,0,0,.18)}
+.spoolmanPickerMain{min-width:0;display:flex;flex-direction:column;gap:2px}
+.spoolmanPickerTitle{font-size:12px;font-weight:800;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.spoolmanPickerFilament{font-size:12px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.spoolmanPickerMaterial,.spoolmanPickerLast,.spoolmanPickerWeight{font-size:12px;white-space:nowrap;color:rgba(255,255,255,.82)}
+.spoolmanPickerWeight{font-weight:800;text-align:right}
+@media (max-width:640px){
+  .spoolmanPickerItem{grid-template-columns:28px minmax(0,1fr) 76px;grid-template-areas:"sw main weight" ". material last";gap:6px 10px}
+  .spoolmanPickerSwatch{grid-area:sw}
+  .spoolmanPickerMain{grid-area:main}
+  .spoolmanPickerWeight{grid-area:weight}
+  .spoolmanPickerMaterial{grid-area:material}
+  .spoolmanPickerLast{grid-area:last;text-align:right}
+}
