@@ -50,14 +50,14 @@ class SlotState(BaseModel):
     def normalize_material(cls, v: Any):
         """Be tolerant for older/hand-edited state.json files.
 
-        - Old versions used placeholders like '-', '—', etc.
+        - Old versions used placeholders like '-', em dash, etc.
         - Users may type anything; unknown strings should not crash the app.
         """
         if v is None:
             return "OTHER"
         if isinstance(v, str):
             vv = v.strip().upper()
-            if vv in ("", "-", "—", "–", "N/A", "NA", "NONE"):
+            if vv in ("", "-", "\u2014", "\u2013", "N/A", "NA", "NONE"):
                 return "OTHER"
             if vv in ("PLA", "PETG", "ABS", "ASA", "TPU", "PA", "PC", "OTHER"):
                 return vv
@@ -66,7 +66,7 @@ class SlotState(BaseModel):
 
 
 class AppState(BaseModel):
-    active_slot: SlotId = "2A"
+    active_slot: SlotId = "1A"
     auto_mode: bool = False
     slots: Dict[SlotId, SlotState]
     updated_at: float = Field(default_factory=lambda: time.time())
@@ -101,11 +101,19 @@ class AppState(BaseModel):
 
     # Current job tracking to attribute filament to slots during a print.
     job_track_name: str = ""
+    job_track_id: str = ""
     job_track_started_at: float = 0.0
     job_track_last_mm: int = 0
-    job_track_slot_mm: Dict[str, int] = Field(default_factory=dict)
+    job_track_slot_mm: Dict[str, float] = Field(default_factory=dict)
     job_track_slot_g: Dict[str, float] = Field(default_factory=dict)
     job_track_last_state: str = ""
+    job_track_file_path: str = ""
+    job_track_last_file_position: int = 0
+    job_track_file_size: int = 0
+    job_track_extruder_mode: str = "relative"
+    job_track_last_e: float = 0.0
+    job_track_parser_slot: str = ""
+    job_track_parser_tail: str = ""
 
     # --- Moonraker global history (read-only, best effort) ---
     # Snapshot of Moonraker's /server/history/list.  Moonraker history does not
@@ -118,6 +126,10 @@ class AppState(BaseModel):
     #   {"job": str, "ts": float, "alloc_g": {"2A": 12.3, ...}}
     # This never talks back to the printer; it's only used to build per-slot history.
     moonraker_allocations: Dict[str, Any] = Field(default_factory=dict)
+
+    # --- Spoolman sync state (persisted, local authority) ---
+    spoolman_status: Dict[str, Any] = Field(default_factory=dict)
+    spoolman_sync_records: Dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("updated_at", mode="before")
     @classmethod
@@ -235,3 +247,26 @@ class UiSpoolSetRemainingRequest(BaseModel):
 class UiSlotResetRequest(BaseModel):
     slot: SlotId
     remaining_g: float
+
+
+class UiSpoolmanConfigRequest(BaseModel):
+    enabled: Optional[bool] = None
+    dry_run: Optional[bool] = None
+    url: Optional[str] = None
+    timeout_sec: Optional[float] = None
+
+
+class UiPrinterConfigRequest(BaseModel):
+    moonraker_url: Optional[str] = None
+    poll_interval_sec: Optional[float] = None
+    filament_diameter_mm: Optional[float] = None
+    cfs_autosync: Optional[bool] = None
+
+
+class UiSpoolmanMappingRequest(BaseModel):
+    slot: SlotId
+    spool_id: Optional[int] = None
+
+
+class UiSpoolmanRetryRequest(BaseModel):
+    record_key: str
