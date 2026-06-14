@@ -1,82 +1,382 @@
 # spoolman-cfs-sync
 
-Creality CFS slot tracking with direct Spoolman post-print reconciliation.
+Creality CFS-aware filament tracking with direct Spoolman synchronization.
 
-This project is based on `jkef80/Filament-Management` and keeps its local CFS
-slot accounting, then adds a conservative Spoolman sync layer.
+This project is based on
+[`jkef80/Filament-Management`](https://github.com/jkef80/Filament-Management).
+It keeps the original idea of local CFS slot accounting, then adds a
+slot-aware Spoolman reconciliation layer for printers where one print can use
+multiple CFS slots.
 
-## What It Does
+The main use case is a rooted Creality K-series printer with CFS, Moonraker, and
+Spoolman.
 
-- Tracks CFS slot usage through Moonraker polling.
-- Attributes print usage to CFS slots such as `1A`, `1B`, `1C`, and `1D`.
-- Maps each CFS slot to an optional Spoolman spool id.
-- Reconciles usage to Spoolman after a print finishes.
-- Sends only `use_length` to Spoolman so Spoolman remains the source of truth
-  for filament weight calculations.
-- Skips Spoolman sync for unmapped or unidentified slots.
+## Why This Exists
 
-## Safety Defaults
+Moonraker's native Spoolman integration tracks one active spool. That works well
+for single-filament prints, but it becomes unreliable for CFS prints because the
+CFS can switch slots during the job. If Moonraker only knows the spool selected
+at the beginning, all usage can be deducted from the wrong Spoolman spool.
 
-Spoolman sync is conservative by default:
+`spoolman-cfs-sync` solves that by:
 
-- `dry_run` defaults to `true`.
-- Real writes require `enabled=true` and `dry_run=false`.
-- Unmapped slots are recorded as `skipped_unmapped` and no Spoolman request is
-  sent.
-- If a Spoolman usage request times out, the record becomes
-  `timeout_uncertain` and is not automatically retried.
-- The app warns when Moonraker's native Spoolman integration appears active,
-  because native Moonraker usage deduction plus this app can double-account.
+- tracking print usage per CFS slot
+- mapping each CFS slot to a Spoolman spool
+- sending one Spoolman usage update per used slot after a print finishes
+- skipping slots that are not mapped
+- preserving local history and safety records to avoid duplicate deductions
 
-## Configuration
+## Current Status
 
-The app creates `data/config.json` on first run.
+This is a working prototype validated against a rooted Creality K1-SE with CFS.
 
-Example Spoolman section:
+The implementation is intentionally conservative:
+
+- sync is post-print, not live per extrusion
+- the app sends filament length only, not calculated weight
+- Spoolman remains the source of truth for weight calculations
+- timeout-uncertain writes are never retried automatically
+- unmapped slots never send anything to Spoolman
+
+## Features
+
+- Moonraker polling for printer, job, virtual SD, and CFS state
+- CFS slot display for connected boxes
+- active CFS slot display
+- local history by slot
+- local spool weight reference tracking
+- Spoolman URL configuration from the UI
+- Spoolman connectivity test
+- searchable Spoolman spool picker
+- per-slot Spoolman spool mapping
+- clear mapping button for empty CFS slots
+- post-print Spoolman usage sync
+- recent sync record history
+- manual retry for safe retryable records
+- debug mode for dry-run and local test-data cleanup controls
+- warning when Moonraker's native Spoolman integration appears to be enabled
+- tests for sync safety, parser behavior, and failure handling
+
+## How It Works
+
+During a print, the app reads the executed G-code stream using Moonraker's
+`virtual_sdcard.file_position`. It parses positive extrusion moves and attributes
+them to the currently selected tool or CFS slot.
+
+Common Orca/Creality tool mapping:
+
+```text
+T0 -> 1A
+T1 -> 1B
+T2 -> 1C
+T3 -> 1D
+```
+
+Direct slot-style tool commands such as `T1A` are also supported.
+
+When the print finishes, the app creates one sync record per used CFS slot. Each
+record is keyed by the print identity and slot id so the same slot/job is not
+sent twice.
+
+For a mapped slot, the app calls Spoolman:
+
+```http
+PUT /api/v1/spool/{spool_id}/use
+Content-Type: application/json
+
+{
+  "use_length": 2345.949
+}
+```
+
+Only `use_length` is sent. Spoolman calculates weight from its own filament and
+spool metadata.
+
+## Safety Model
+
+The sync layer is designed to avoid accidental inventory damage.
+
+Important statuses:
+
+| Status | Meaning |
+| --- | --- |
+| `dry_run` | Usage was recorded locally but not sent to Spoolman. |
+| `synced` | Usage was successfully sent to Spoolman. |
+| `skipped_unmapped` | The slot had no Spoolman spool mapping. No request was sent. |
+| `skipped_invalid_spool` | The mapped Spoolman spool id did not validate. No usage request was sent. |
+| `failed` | A clean retryable failure happened before the usage result became uncertain. |
+| `timeout_uncertain` | The usage request result is unknown. Spoolman may already have deducted usage. |
+| `conflict` | An existing record for the same print/slot has different usage. The app refuses to resend. |
+
+`timeout_uncertain` is intentionally not retryable from the UI. Check Spoolman
+inventory manually before deciding what to do.
+
+## Requirements
+
+- Python 3.11 or 3.12
+- Moonraker reachable from the machine running this app
+- Spoolman reachable from the machine running this app
+- Rooted Creality K-series printer with Moonraker access
+- CFS installed and visible through Moonraker/Creality objects
+
+Python 3.12 is the recommended local development version for the current pinned
+dependencies.
+
+## Quick Start
+
+Clone your fork or this repository:
+
+```powershell
+git clone https://github.com/nick-amorim/spoolman-cfs-sync.git
+cd spoolman-cfs-sync
+```
+
+Create a virtual environment:
+
+```powershell
+py -3.12 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+```
+
+Install dependencies:
+
+```powershell
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+```
+
+Start the app:
+
+```powershell
+python -m uvicorn main:app --host 0.0.0.0 --port 8005
+```
+
+Open:
+
+```text
+http://localhost:8005
+```
+
+If running on another machine, replace `localhost` with that machine's IP.
+
+## Linux / Printer-Adjacent Start
+
+Example manual setup on Linux:
+
+```bash
+git clone https://github.com/nick-amorim/spoolman-cfs-sync.git
+cd spoolman-cfs-sync
+python3 -m venv venv
+source venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+python -m uvicorn main:app --host 0.0.0.0 --port 8005
+```
+
+The inherited `install.sh` still needs a dedicated pass before it should be used
+as the recommended installer for this fork. Manual startup is the safest path
+for now.
+
+## First Configuration
+
+The app creates `data/config.json` on first run. You can configure most settings
+from the web UI.
+
+Open **Settings** and set:
+
+- Moonraker URL, for example `http://192.168.1.12:7125`
+- Poll interval, usually `5`
+- Filament diameter, usually `1.75`
+- whether to import CFS material, color, and name into local slots
+
+Then use the **Spoolman Sync** panel:
+
+1. Enter your Spoolman base URL, for example `http://192.168.1.72:7912`.
+2. Click **Test**.
+3. Enable sync.
+4. For each CFS slot, click **Select Spool**.
+5. Pick the matching Spoolman spool from the searchable list.
+6. Use **Clear** if the CFS slot becomes empty or should not sync.
+
+The app expects the base Spoolman URL only. It appends `/api/v1` internally.
+
+## Example Config
 
 ```json
 {
+  "moonraker_url": "http://192.168.1.12:7125",
+  "poll_interval_sec": 5.0,
+  "filament_diameter_mm": 1.75,
+  "cfs_autosync": true,
   "spoolman": {
-    "enabled": false,
-    "dry_run": true,
-    "url": "http://192.168.1.50:7912",
+    "enabled": true,
+    "dry_run": false,
+    "url": "http://192.168.1.72:7912",
     "sync_mode": "post_print",
-    "timeout_sec": 5,
+    "timeout_sec": 5.0,
     "slot_mappings": {
-      "1A": 12,
-      "1B": null,
-      "1C": null,
-      "1D": null
+      "1A": 16,
+      "1B": 7,
+      "1C": 1,
+      "1D": 10,
+      "2A": null,
+      "2B": null,
+      "2C": null,
+      "2D": null
     }
   }
 }
 ```
 
-You can also edit Spoolman URL, dry-run/write mode, and slot mappings from the
-web UI.
+Do not commit `data/config.json`. It is intentionally ignored by Git.
 
-## Spoolman API
+## UI Guide
 
-The app uses:
+### Box Cards
 
-```http
-POST /api/v1/spool/{spool_id}/use
-Content-Type: application/json
+Shows connected CFS boxes and slots. Each slot displays:
 
-{
-  "use_length": 1234.5
-}
+- slot label
+- material
+- color
+- local remaining weight, if a local reference was set
+- active/ready/empty state
+
+If the printer does not report an active CFS slot, the active slot panel shows
+`No active slot` instead of falling back to `1A`.
+
+### Active Slot
+
+Shows the currently reported CFS active slot. During printing, it can show live
+slot usage based on parsed executed G-code.
+
+### History By Slot
+
+Shows recent local usage entries per slot. This is local app history and is kept
+separate from Spoolman inventory.
+
+### Local Spool Weight
+
+Click a slot to open the local spool editor:
+
+- **Current weight (g)** updates the local remaining-weight reference.
+- **New spool (g)** starts a new local spool epoch for that slot.
+
+This is local display/accounting only. Spoolman inventory is changed only by the
+Spoolman sync records.
+
+### Spoolman Sync
+
+Controls Spoolman integration:
+
+- Spoolman URL
+- enable sync
+- connection test
+- slot-to-spool mappings
+- recent sync records
+- retry buttons for retryable records
+
+Mapped rows display spool color, id, name, material, and remaining weight when
+Spoolman details are available.
+
+### Debug Mode
+
+Open **Settings** and enable **Debug mode** to reveal:
+
+- Dry-run toggle
+- Clear Test Data button
+
+Normal use should keep debug mode off.
+
+## Native Moonraker Spoolman Warning
+
+If Moonraker's native Spoolman integration is enabled at the same time as this
+app, filament can be deducted twice:
+
+1. Moonraker deducts from its single active spool.
+2. `spoolman-cfs-sync` deducts from each mapped CFS slot.
+
+The app shows a warning when it detects native Moonraker Spoolman integration.
+For production use, avoid having both systems deduct the same print.
+
+## Testing
+
+Install dev dependencies:
+
+```powershell
+python -m pip install -r requirements-dev.txt
 ```
 
-Spoolman docs:
+Run tests:
 
-- https://donkie.github.io/Spoolman/
+```powershell
+python -m pytest tests
+```
+
+Run Python compile checks:
+
+```powershell
+python -m py_compile main.py models\schemas.py
+```
+
+Known local passing result:
+
+```text
+29 passed
+```
+
+GitHub Actions also runs the test suite on pull requests and pushes.
+
+## Development Workflow
+
+Recommended flow:
+
+```powershell
+git switch -c feature/my-change origin/main
+# make changes
+python -m pytest tests
+git add .
+git commit -m "Describe the change"
+git push -u origin feature/my-change
+```
+
+Open a pull request into your fork's `main`. The repository is configured for:
+
+- squash merge only
+- protected `main`
+- required `pytest` check
+- force-push and deletion protection on `main`
+
+## Important Files
+
+| Path | Purpose |
+| --- | --- |
+| `main.py` | FastAPI app, Moonraker polling, CFS tracking, Spoolman sync logic. |
+| `models/schemas.py` | Pydantic request/state models. |
+| `static/index.html` | Main UI shell. |
+| `static/app.js` | Browser UI behavior. |
+| `static/style.css` | UI styling. |
+| `data/config.json` | Local runtime config, ignored by Git. |
+| `data/state.json` | Local runtime state, ignored by Git. |
+| `tests/test_spoolman_sync.py` | Regression tests for sync and parser behavior. |
+| `.github/workflows/tests.yml` | CI workflow. |
+
+## Current Limitations
+
+- Sync is post-print only.
+- No automatic spool creation in Spoolman.
+- No automatic spool matching by color/material/name.
+- No live per-extrusion Spoolman writes.
+- No automatic compensation for Moonraker native Spoolman deductions.
+- `install.sh` is inherited and should be reviewed before being treated as the
+  recommended installer for this fork.
+
+## Credits
+
+Based on
+[`jkef80/Filament-Management`](https://github.com/jkef80/Filament-Management).
+
+Spoolman:
+
 - https://github.com/Donkie/Spoolman
-
-## Development Notes
-
-Planning docs are in:
-
-- `docs/discovery/spoolman-cfs-sync-discovery.md`
-- `docs/plans/spoolman-cfs-sync-implementation-plan.md`
-
+- https://donkie.github.io/Spoolman/
