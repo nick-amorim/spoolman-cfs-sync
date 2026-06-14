@@ -625,10 +625,12 @@ function renderSpoolman(state, connectedBoxes, slots) {
   const records = state.spoolman_sync_records || {};
   const dryRun = cfg.dry_run !== false;
   const enabled = cfg.enabled === true;
+  const syncMode = cfg.sync_mode === "live" ? "live" : "post_print";
   ensureSpoolmanSpoolsLoadedForPanel(cfg);
   if (meta) {
     const mode = enabled && !dryRun ? "writes enabled" : (dryRun ? "dry-run" : "disabled");
-    meta.textContent = debugMode ? `${mode} - debug` : mode;
+    const timing = syncMode === "live" ? "live" : "post-print";
+    meta.textContent = debugMode ? `${mode} - ${timing} - debug` : `${mode} - ${timing}`;
   }
 
   const statusRow = document.createElement("div");
@@ -641,6 +643,10 @@ function renderSpoolman(state, connectedBoxes, slots) {
   mode.className = "tag " + (enabled && !dryRun ? "ok" : (dryRun ? "warn" : "muted"));
   mode.textContent = enabled && !dryRun ? "Sync enabled" : (dryRun ? "Dry-run mode" : "Sync disabled");
   statusRow.appendChild(mode);
+  const timing = document.createElement("span");
+  timing.className = "tag " + (syncMode === "live" ? "ok" : "muted");
+  timing.textContent = syncMode === "live" ? "Live sync" : "Post-print sync";
+  statusRow.appendChild(timing);
   panel.appendChild(statusRow);
 
   if (status.moonraker_native_detected) {
@@ -677,12 +683,46 @@ function renderSpoolman(state, connectedBoxes, slots) {
   dryLabel.appendChild(document.createTextNode("Dry-run"));
   if (debugMode) cfgBox.appendChild(dryLabel);
 
+  const modeSelect = document.createElement("select");
+  modeSelect.className = "spoolmanMode";
+  const postOpt = document.createElement("option");
+  postOpt.value = "post_print";
+  postOpt.textContent = "Post-print";
+  modeSelect.appendChild(postOpt);
+  const liveOpt = document.createElement("option");
+  liveOpt.value = "live";
+  liveOpt.textContent = "Live";
+  modeSelect.appendChild(liveOpt);
+  modeSelect.value = syncMode;
+  cfgBox.appendChild(modeSelect);
+
+  const liveDeltaInput = document.createElement("input");
+  liveDeltaInput.type = "number";
+  liveDeltaInput.min = "1";
+  liveDeltaInput.max = "5000";
+  liveDeltaInput.step = "1";
+  liveDeltaInput.className = "spoolmanLiveDelta";
+  liveDeltaInput.title = "Minimum new filament length before a live Spoolman update";
+  liveDeltaInput.value = String(cfg.live_min_delta_mm || 100);
+  const updateLiveDeltaVisibility = () => {
+    liveDeltaInput.style.display = modeSelect.value === "live" ? "" : "none";
+  };
+  modeSelect.onchange = updateLiveDeltaVisibility;
+  updateLiveDeltaVisibility();
+  cfgBox.appendChild(liveDeltaInput);
+
   const saveBtn = document.createElement("button");
   saveBtn.className = "btn mini";
   saveBtn.type = "button";
   saveBtn.textContent = "Save";
   saveBtn.onclick = async () => {
-    await postJson("/api/ui/spoolman/config", { url: urlInput.value, enabled: enInput.checked, dry_run: debugMode ? dryInput.checked : false });
+    await postJson("/api/ui/spoolman/config", {
+      url: urlInput.value,
+      enabled: enInput.checked,
+      dry_run: debugMode ? dryInput.checked : false,
+      sync_mode: modeSelect.value,
+      live_min_delta_mm: Number(liveDeltaInput.value || 100),
+    });
     await tick();
   };
   cfgBox.appendChild(saveBtn);
@@ -769,7 +809,8 @@ function renderSpoolman(state, connectedBoxes, slots) {
       row.appendChild(main);
       const sub = document.createElement("div");
       sub.className = "spoolmanRecordSub";
-      sub.textContent = `${spoolmanStatusLabel(rec.status)} - ${rec.job || ""}`;
+      const phase = rec.sync_phase ? `${rec.sync_phase} - ` : "";
+      sub.textContent = `${spoolmanStatusLabel(rec.status)} - ${phase}${rec.job || ""}`;
       row.appendChild(sub);
       if (rec.error) {
         const err = document.createElement("div");
@@ -777,7 +818,7 @@ function renderSpoolman(state, connectedBoxes, slots) {
         err.textContent = String(rec.error).slice(0, 220);
         row.appendChild(err);
       }
-      if (["failed", "pending", "skipped_invalid_spool", "skipped_unmapped", "dry_run"].includes(String(rec.status || ""))) {
+      if (rec.sync_phase !== "live" && ["failed", "pending", "skipped_invalid_spool", "skipped_unmapped", "dry_run"].includes(String(rec.status || ""))) {
         const retry = document.createElement("button");
         retry.className = "btn mini";
         retry.type = "button";

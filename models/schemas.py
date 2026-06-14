@@ -114,6 +114,10 @@ class AppState(BaseModel):
     job_track_last_e: float = 0.0
     job_track_parser_slot: str = ""
     job_track_parser_tail: str = ""
+    job_track_spoolman_live_synced_mm: Dict[str, float] = Field(default_factory=dict)
+    job_track_spoolman_live_last_attempt_mm: Dict[str, float] = Field(default_factory=dict)
+    job_track_spoolman_live_seq: Dict[str, int] = Field(default_factory=dict)
+    job_track_spoolman_live_blocked: Dict[str, Any] = Field(default_factory=dict)
 
     # --- Moonraker global history (read-only, best effort) ---
     # Snapshot of Moonraker's /server/history/list.  Moonraker history does not
@@ -253,6 +257,8 @@ class UiSpoolmanConfigRequest(BaseModel):
     enabled: Optional[bool] = None
     dry_run: Optional[bool] = None
     url: Optional[str] = None
+    sync_mode: Optional[str] = None
+    live_min_delta_mm: Optional[float] = None
     timeout_sec: Optional[float] = None
 
 

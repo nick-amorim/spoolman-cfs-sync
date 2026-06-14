@@ -103,6 +103,7 @@ def _default_spoolman_config() -> dict:
         "dry_run": True,
         "url": "",
         "sync_mode": "post_print",
+        "live_min_delta_mm": 100.0,
         "timeout_sec": 5,
         "slot_mappings": {sid: None for sid in DEFAULT_SLOTS},
     }
@@ -114,6 +115,7 @@ def _default_spoolman_status() -> dict:
         "last_check_at": 0.0,
         "last_error": "",
         "dry_run": True,
+        "sync_mode": "post_print",
         "moonraker_native_detected": False,
         "moonraker_native_warning": "",
     }
@@ -149,8 +151,16 @@ def _normalize_spoolman_config(cfg: dict) -> dict:
         out["timeout_sec"] = max(1.0, min(timeout, 30.0))
     except Exception:
         out["timeout_sec"] = 5.0
-    if str(out.get("sync_mode") or "") != "post_print":
+    sync_mode = str(out.get("sync_mode") or "post_print").strip().lower()
+    if sync_mode not in ("post_print", "live"):
         out["sync_mode"] = "post_print"
+    else:
+        out["sync_mode"] = sync_mode
+    try:
+        live_min = float(out.get("live_min_delta_mm", 100.0) or 100.0)
+        out["live_min_delta_mm"] = max(1.0, min(live_min, 5000.0))
+    except Exception:
+        out["live_min_delta_mm"] = 100.0
     return out
 
 
@@ -161,6 +171,7 @@ def _spoolman_public_config() -> dict:
         "dry_run": cfg["dry_run"],
         "url": cfg["url"],
         "sync_mode": cfg["sync_mode"],
+        "live_min_delta_mm": cfg["live_min_delta_mm"],
         "timeout_sec": cfg["timeout_sec"],
         "slot_mappings": cfg["slot_mappings"],
     }
@@ -314,6 +325,10 @@ def _ensure_data_files() -> None:
             "job_track_last_e": 0.0,
             "job_track_parser_slot": "",
             "job_track_parser_tail": "",
+            "job_track_spoolman_live_synced_mm": {},
+            "job_track_spoolman_live_last_attempt_mm": {},
+            "job_track_spoolman_live_seq": {},
+            "job_track_spoolman_live_blocked": {},
             # snapshot from Moonraker history (global list)
             "moonraker_history": [],
             # local manual allocations for Moonraker history -> slots
@@ -445,6 +460,10 @@ def _migrate_state_dict(data: dict) -> dict:
     data.setdefault("job_track_last_e", 0.0)
     data.setdefault("job_track_parser_slot", "")
     data.setdefault("job_track_parser_tail", "")
+    data.setdefault("job_track_spoolman_live_synced_mm", {})
+    data.setdefault("job_track_spoolman_live_last_attempt_mm", {})
+    data.setdefault("job_track_spoolman_live_seq", {})
+    data.setdefault("job_track_spoolman_live_blocked", {})
 
     # Moonraker history snapshot
     data.setdefault("moonraker_history", [])
@@ -988,6 +1007,10 @@ def _base_spoolman_record(
     }
 
 
+def _spoolman_record_key_phase(job_key: str, slot_id: str, phase: str) -> str:
+    return f"{_spoolman_record_key(job_key, slot_id)}:{str(phase or '').strip()}"
+
+
 def _save_spoolman_record(state: AppState, key: str, record: dict) -> None:
     record["updated_at"] = _now()
     records = dict(getattr(state, "spoolman_sync_records", {}) or {})
@@ -1084,6 +1107,137 @@ def _spoolman_sync_record(state: AppState, key: str, record: dict, cfg: dict) ->
     return record
 
 
+def _live_spoolman_print_key(job_name: str, start_ts: float, job_id: Optional[str] = None) -> str:
+    if str(job_id or "").strip():
+        return _stable_print_key(job_name, start_ts, 0, job_id=job_id)
+    safe_name = str(job_name or "unknown").replace(":", "_")
+    return f"live:{safe_name}:{int(float(start_ts or 0.0))}"
+
+
+def _live_spoolman_maps(state: AppState) -> tuple[dict, dict, dict, dict]:
+    synced = getattr(state, "job_track_spoolman_live_synced_mm", {})
+    attempted = getattr(state, "job_track_spoolman_live_last_attempt_mm", {})
+    seqs = getattr(state, "job_track_spoolman_live_seq", {})
+    blocked = getattr(state, "job_track_spoolman_live_blocked", {})
+    if not isinstance(synced, dict):
+        synced = {}
+    if not isinstance(attempted, dict):
+        attempted = {}
+    if not isinstance(seqs, dict):
+        seqs = {}
+    if not isinstance(blocked, dict):
+        blocked = {}
+    return synced, attempted, seqs, blocked
+
+
+def _slot_used_g_for_mm(state: AppState, slot_id: str, used_mm: float, slot_g_total: dict, slot_mm_total: dict) -> float:
+    try:
+        total_mm = float(slot_mm_total.get(slot_id, 0.0) or 0.0)
+        total_g = float(slot_g_total.get(slot_id, 0.0) or 0.0)
+        if total_mm > 0 and total_g > 0:
+            return float(used_mm) * (total_g / total_mm)
+    except Exception:
+        pass
+    try:
+        mat = state.slots.get(slot_id).material if slot_id in state.slots else "OTHER"
+        return float(mm_to_g(str(mat), float(used_mm)))
+    except Exception:
+        return 0.0
+
+
+def _has_blocking_live_spoolman_record(state: AppState, job_key: str, slot_id: str) -> Optional[dict]:
+    prefix = f"{_spoolman_record_key(job_key, slot_id)}:live:"
+    records = getattr(state, "spoolman_sync_records", {}) or {}
+    if not isinstance(records, dict):
+        return None
+    for key, rec in records.items():
+        if not str(key).startswith(prefix) or not isinstance(rec, dict):
+            continue
+        if str(rec.get("status") or "") in ("timeout_uncertain", "conflict"):
+            return rec
+    return None
+
+
+def _plan_spoolman_live_sync_for_current_job(state: AppState) -> None:
+    cfg = _normalize_spoolman_config(load_config())
+    if str(cfg.get("sync_mode") or "") != "live":
+        return
+    if not (bool(cfg.get("dry_run", True)) or bool(cfg.get("enabled", False))):
+        return
+
+    job_name = str(getattr(state, "job_track_name", "") or "").strip()
+    if not job_name:
+        return
+    start_ts = float(getattr(state, "job_track_started_at", 0.0) or 0.0)
+    job_id = str(getattr(state, "job_track_id", "") or "").strip()
+    job_key = _live_spoolman_print_key(job_name, start_ts, job_id=job_id)
+
+    slot_mm = getattr(state, "job_track_slot_mm", {}) if isinstance(getattr(state, "job_track_slot_mm", {}), dict) else {}
+    slot_g = getattr(state, "job_track_slot_g", {}) if isinstance(getattr(state, "job_track_slot_g", {}), dict) else {}
+    mappings = cfg.get("slot_mappings") if isinstance(cfg.get("slot_mappings"), dict) else {}
+    synced, attempted, seqs, blocked = _live_spoolman_maps(state)
+    min_delta = float(cfg.get("live_min_delta_mm", 100.0) or 100.0)
+    changed = False
+
+    for sid, total_val in slot_mm.items():
+        sid_s = str(sid).strip().upper()
+        if sid_s not in DEFAULT_SLOTS:
+            continue
+        if sid_s in blocked:
+            continue
+        spool_id = mappings.get(sid_s)
+        if not spool_id:
+            continue
+        try:
+            total_mm = float(total_val or 0.0)
+            synced_mm = float(synced.get(sid_s, 0.0) or 0.0)
+            attempted_mm = float(attempted.get(sid_s, 0.0) or 0.0)
+        except Exception:
+            continue
+        if total_mm <= 0 or total_mm <= synced_mm:
+            continue
+        if (total_mm - attempted_mm) < min_delta:
+            continue
+
+        used_mm = float(max(0.0, total_mm - synced_mm))
+        used_g = _slot_used_g_for_mm(state, sid_s, used_mm, slot_g, slot_mm)
+        seq = int(seqs.get(sid_s, 0) or 0) + 1
+        record = _base_spoolman_record(
+            job_key=job_key,
+            job_name=job_name,
+            slot_id=sid_s,
+            spool_id=spool_id,
+            used_mm=used_mm,
+            used_g=used_g,
+            result="printing",
+        )
+        record["sync_phase"] = "live"
+        record["total_mm_after"] = float(round(total_mm, 3))
+        key = _spoolman_record_key_phase(job_key, sid_s, f"live:{seq}")
+
+        rec = _spoolman_sync_record(state, key, record, cfg)
+        status = str(rec.get("status") or "")
+        attempted[sid_s] = total_mm
+        seqs[sid_s] = seq
+        changed = True
+        if status == "synced":
+            synced[sid_s] = total_mm
+        elif status in ("timeout_uncertain", "conflict"):
+            blocked[sid_s] = {
+                "record_key": key,
+                "status": status,
+                "error": rec.get("error", ""),
+                "at_mm": total_mm,
+            }
+
+    state.job_track_spoolman_live_synced_mm = synced
+    state.job_track_spoolman_live_last_attempt_mm = attempted
+    state.job_track_spoolman_live_seq = seqs
+    state.job_track_spoolman_live_blocked = blocked
+    if changed:
+        save_state(state)
+
+
 def _plan_spoolman_sync_for_finished_job(
     state: AppState,
     job_name: str,
@@ -1100,25 +1254,50 @@ def _plan_spoolman_sync_for_finished_job(
     slot_g = getattr(state, "job_track_slot_g", {}) if isinstance(getattr(state, "job_track_slot_g", {}), dict) else {}
     mappings = cfg.get("slot_mappings") if isinstance(cfg.get("slot_mappings"), dict) else {}
     job_key = _stable_print_key(job_name, start_ts, end_ts, job_id=job_id)
+    live_mode = str(cfg.get("sync_mode") or "") == "live"
+    live_job_key = _live_spoolman_print_key(job_name, start_ts, job_id=job_id)
+    live_synced, _, _, live_blocked = _live_spoolman_maps(state)
 
     for sid, mm_val in slot_mm.items():
         sid_s = str(sid).strip().upper()
         try:
-            used_mm = float(mm_val or 0.0)
+            total_mm = float(mm_val or 0.0)
         except Exception:
-            used_mm = 0.0
+            total_mm = 0.0
+        if total_mm <= 0:
+            continue
+
+        if live_mode:
+            if sid_s in live_blocked or _has_blocking_live_spoolman_record(state, live_job_key, sid_s):
+                record = _base_spoolman_record(
+                    job_key=job_key,
+                    job_name=job_name,
+                    slot_id=sid_s,
+                    spool_id=mappings.get(sid_s),
+                    used_mm=max(0.0, total_mm - float(live_synced.get(sid_s, 0.0) or 0.0)),
+                    used_g=_slot_used_g_for_mm(
+                        state,
+                        sid_s,
+                        max(0.0, total_mm - float(live_synced.get(sid_s, 0.0) or 0.0)),
+                        slot_g,
+                        slot_mm,
+                    ),
+                    result=result,
+                    status="timeout_uncertain",
+                    error="Live Spoolman sync for this slot has an uncertain record. Verify Spoolman inventory before final reconciliation.",
+                )
+                record["sync_phase"] = "final"
+                _save_spoolman_record(state, _spoolman_record_key_phase(job_key, sid_s, "final"), record)
+                continue
+            try:
+                used_mm = max(0.0, total_mm - float(live_synced.get(sid_s, 0.0) or 0.0))
+            except Exception:
+                used_mm = total_mm
+        else:
+            used_mm = total_mm
         if used_mm <= 0:
             continue
-        try:
-            used_g = float(slot_g.get(sid_s, 0.0) or 0.0)
-        except Exception:
-            used_g = 0.0
-        if used_g <= 0:
-            try:
-                mat = state.slots.get(sid_s).material if sid_s in state.slots else "OTHER"
-                used_g = float(mm_to_g(str(mat), used_mm))
-            except Exception:
-                used_g = 0.0
+        used_g = _slot_used_g_for_mm(state, sid_s, used_mm, slot_g, slot_mm)
 
         spool_id = mappings.get(sid_s)
         record = _base_spoolman_record(
@@ -1130,7 +1309,9 @@ def _plan_spoolman_sync_for_finished_job(
             used_g=used_g,
             result=result,
         )
-        _spoolman_sync_record(state, _spoolman_record_key(job_key, sid_s), record, cfg)
+        record["sync_phase"] = "final" if live_mode else "post_print"
+        key = _spoolman_record_key_phase(job_key, sid_s, "final") if live_mode else _spoolman_record_key(job_key, sid_s)
+        _spoolman_sync_record(state, key, record, cfg)
 
 
 def _update_spoolman_config(update: dict) -> dict:
@@ -1141,7 +1322,7 @@ def _update_spoolman_config(update: dict) -> dict:
     raw = cfg.get("spoolman") if isinstance(cfg.get("spoolman"), dict) else {}
     raw = dict(raw)
     raw.update(spool_cfg)
-    for key in ("enabled", "dry_run", "url", "timeout_sec"):
+    for key in ("enabled", "dry_run", "url", "timeout_sec", "sync_mode", "live_min_delta_mm"):
         if key in update and update[key] is not None:
             raw[key] = update[key]
     cfg["spoolman"] = _normalize_spoolman_config({"spoolman": raw})
@@ -1583,9 +1764,11 @@ async def moonraker_poll_loop() -> None:
             st = load_state()
             st.printer_connected = True
             st.printer_last_error = ""
+            spoolman_cfg_now = _normalize_spoolman_config(load_config())
             _set_spoolman_status(
                 st,
-                dry_run=bool(_normalize_spoolman_config(load_config()).get("dry_run", True)),
+                dry_run=bool(spoolman_cfg_now.get("dry_run", True)),
+                sync_mode=str(spoolman_cfg_now.get("sync_mode") or "post_print"),
                 moonraker_native_detected=bool(native_spoolman_detected),
                 moonraker_native_warning=native_spoolman_warning,
             )
@@ -1654,6 +1837,10 @@ async def moonraker_poll_loop() -> None:
                         st.job_track_last_e = 0.0
                         st.job_track_parser_slot = curr_slot
                         st.job_track_parser_tail = ""
+                        st.job_track_spoolman_live_synced_mm = {}
+                        st.job_track_spoolman_live_last_attempt_mm = {}
+                        st.job_track_spoolman_live_seq = {}
+                        st.job_track_spoolman_live_blocked = {}
                     elif job_id and not str(getattr(st, "job_track_id", "") or "").strip():
                         st.job_track_id = job_id
 
@@ -1678,6 +1865,11 @@ async def moonraker_poll_loop() -> None:
                             _set_spoolman_status(st, last_error=f"G-code usage parser failed: {e}")
                     st.job_track_last_mm = _job_track_total_mm(st)
                     st.job_track_last_state = ps_state
+
+                    try:
+                        _plan_spoolman_live_sync_for_current_job(st)
+                    except Exception as e:
+                        _set_spoolman_status(st, last_error=f"Live Spoolman sync failed: {e}")
 
                     # Publish a single "live" history entry per slot for the current job.
                     # This makes the right-hand "History by Slot" useful during
@@ -1792,6 +1984,10 @@ async def moonraker_poll_loop() -> None:
                     st.job_track_last_e = 0.0
                     st.job_track_parser_slot = ""
                     st.job_track_parser_tail = ""
+                    st.job_track_spoolman_live_synced_mm = {}
+                    st.job_track_spoolman_live_last_attempt_mm = {}
+                    st.job_track_spoolman_live_seq = {}
+                    st.job_track_spoolman_live_blocked = {}
             except Exception:
                 pass
 
@@ -2052,6 +2248,10 @@ def _clear_local_accounting(state: AppState) -> AppState:
     state.job_track_last_e = 0.0
     state.job_track_parser_slot = ""
     state.job_track_parser_tail = ""
+    state.job_track_spoolman_live_synced_mm = {}
+    state.job_track_spoolman_live_last_attempt_mm = {}
+    state.job_track_spoolman_live_seq = {}
+    state.job_track_spoolman_live_blocked = {}
 
     for sid, slot in list((state.slots or {}).items()):
         try:
@@ -2096,7 +2296,11 @@ def api_ui_spoolman_config(req: UiSpoolmanConfigRequest) -> ApiResponse:
     update = _req_dump(req, exclude_unset=True)
     cfg = _update_spoolman_config(update)
     st = load_state()
-    _set_spoolman_status(st, dry_run=bool(cfg.get("dry_run", True)))
+    _set_spoolman_status(
+        st,
+        dry_run=bool(cfg.get("dry_run", True)),
+        sync_mode=str(cfg.get("sync_mode") or "post_print"),
+    )
     save_state(st)
     return ApiResponse(result=_ui_state_dict(st))
 
@@ -2119,6 +2323,7 @@ def api_ui_spoolman_test() -> ApiResponse:
             last_check_at=_now(),
             last_error="",
             dry_run=bool(cfg.get("dry_run", True)),
+            sync_mode=str(cfg.get("sync_mode") or "post_print"),
         )
     except Exception as e:
         _set_spoolman_status(
@@ -2127,6 +2332,7 @@ def api_ui_spoolman_test() -> ApiResponse:
             last_check_at=_now(),
             last_error=str(e),
             dry_run=bool(cfg.get("dry_run", True)),
+            sync_mode=str(cfg.get("sync_mode") or "post_print"),
         )
     save_state(st)
     return ApiResponse(result=_ui_state_dict(st))
@@ -2144,6 +2350,7 @@ def api_ui_spoolman_spools() -> ApiResponse:
             last_check_at=_now(),
             last_error="",
             dry_run=bool(cfg.get("dry_run", True)),
+            sync_mode=str(cfg.get("sync_mode") or "post_print"),
         )
         save_state(st)
         return ApiResponse(result={"spools": spools, "status": st.spoolman_status})
@@ -2154,6 +2361,7 @@ def api_ui_spoolman_spools() -> ApiResponse:
             last_check_at=_now(),
             last_error=str(e),
             dry_run=bool(cfg.get("dry_run", True)),
+            sync_mode=str(cfg.get("sync_mode") or "post_print"),
         )
         save_state(st)
         raise HTTPException(status_code=502, detail=str(e))
@@ -2171,6 +2379,11 @@ def api_ui_spoolman_retry(req: UiSpoolmanRetryRequest) -> ApiResponse:
         raise HTTPException(
             status_code=409,
             detail="Timeout-uncertain records are not automatically retryable. Verify Spoolman inventory first.",
+        )
+    if str(rec.get("sync_phase") or "") == "live":
+        raise HTTPException(
+            status_code=409,
+            detail="Live sync records are reconciled by later live chunks or the final sync record.",
         )
     if status not in ("failed", "pending", "skipped_invalid_spool", "skipped_unmapped", "dry_run"):
         raise HTTPException(status_code=409, detail=f"Record with status {status!r} cannot be retried")
@@ -2483,6 +2696,10 @@ def default_state() -> AppState:
         cfs_active_slot=None,
         cfs_slots={},
         cfs_raw={},
+        job_track_spoolman_live_synced_mm={},
+        job_track_spoolman_live_last_attempt_mm={},
+        job_track_spoolman_live_seq={},
+        job_track_spoolman_live_blocked={},
         spoolman_status=_default_spoolman_status(),
         spoolman_sync_records={},
     )
