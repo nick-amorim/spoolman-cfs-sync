@@ -104,6 +104,7 @@ class AppState(BaseModel):
     job_track_id: str = ""
     job_track_started_at: float = 0.0
     job_track_last_mm: int = 0
+    job_track_printer_used_mm: float = 0.0
     job_track_slot_mm: Dict[str, float] = Field(default_factory=dict)
     job_track_slot_g: Dict[str, float] = Field(default_factory=dict)
     job_track_last_state: str = ""

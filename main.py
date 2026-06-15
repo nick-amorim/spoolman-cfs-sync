@@ -315,6 +315,7 @@ def _ensure_data_files() -> None:
             "job_track_id": "",
             "job_track_started_at": 0.0,
             "job_track_last_mm": 0,
+            "job_track_printer_used_mm": 0.0,
             "job_track_slot_mm": {},
             "job_track_slot_g": {},
             "job_track_last_state": "",
@@ -450,6 +451,7 @@ def _migrate_state_dict(data: dict) -> dict:
     data.setdefault("job_track_id", "")
     data.setdefault("job_track_started_at", 0.0)
     data.setdefault("job_track_last_mm", 0)
+    data.setdefault("job_track_printer_used_mm", 0.0)
     data.setdefault("job_track_slot_mm", {})
     data.setdefault("job_track_slot_g", {})
     data.setdefault("job_track_last_state", "")
@@ -1180,7 +1182,7 @@ def _plan_spoolman_live_sync_for_current_job(state: AppState) -> None:
     scale = 1.0
     try:
         parsed_total_mm = sum(max(0.0, float(v or 0.0)) for v in slot_mm.values())
-        printer_total_mm = float(getattr(state, "current_job_filament_mm", 0.0) or 0.0)
+        printer_total_mm = float(getattr(state, "job_track_printer_used_mm", 0.0) or 0.0)
         if parsed_total_mm > 0 and 0 < printer_total_mm < parsed_total_mm:
             scale = printer_total_mm / parsed_total_mm
     except Exception:
@@ -1804,9 +1806,11 @@ async def moonraker_poll_loop() -> None:
             job_id = _moonraker_current_job_id(ps, vsd)
             used = ps.get("filament_used")
             if used is None:
+                printer_used_mm = 0.0
                 used_mm = 0
             else:
-                used_mm = int(float(used))
+                printer_used_mm = float(max(0.0, float(used)))
+                used_mm = int(printer_used_mm)
             try:
                 file_position = int(float(vsd.get("file_position") or 0))
             except Exception:
@@ -1891,6 +1895,7 @@ async def moonraker_poll_loop() -> None:
                         st.job_track_id = job_id
                         st.job_track_started_at = _now()
                         st.job_track_last_mm = 0
+                        st.job_track_printer_used_mm = 0.0
                         st.job_track_slot_mm = {}
                         st.job_track_slot_g = {}
                         st.job_track_last_state = ps_state
@@ -1907,6 +1912,8 @@ async def moonraker_poll_loop() -> None:
                         st.job_track_spoolman_live_blocked = {}
                     elif job_id and not str(getattr(st, "job_track_id", "") or "").strip():
                         st.job_track_id = job_id
+
+                    st.job_track_printer_used_mm = printer_used_mm
 
                     if file_size > 0:
                         st.job_track_file_size = max(int(st.job_track_file_size or 0), file_size)
@@ -2039,6 +2046,7 @@ async def moonraker_poll_loop() -> None:
                     st.job_track_id = ""
                     st.job_track_started_at = 0.0
                     st.job_track_last_mm = 0
+                    st.job_track_printer_used_mm = 0.0
                     st.job_track_slot_mm = {}
                     st.job_track_slot_g = {}
                     st.job_track_last_state = ps_state
@@ -2304,6 +2312,7 @@ def _clear_local_accounting(state: AppState) -> AppState:
     state.job_track_id = ""
     state.job_track_started_at = 0.0
     state.job_track_last_mm = 0
+    state.job_track_printer_used_mm = 0.0
     state.job_track_slot_mm = {}
     state.job_track_slot_g = {}
     state.job_track_last_state = ""
