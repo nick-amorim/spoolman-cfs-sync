@@ -245,7 +245,23 @@ run_update() {
   [[ -n "$UPDATE_CTID" ]] || return 1
   pct status "$UPDATE_CTID" >/dev/null 2>&1 || die "Container ${UPDATE_CTID} does not exist."
   info "Running ${APP_NAME} updater in CT ${UPDATE_CTID}"
-  pct exec "$UPDATE_CTID" -- bash -lc "if command -v update >/dev/null 2>&1; then update; else spoolman-cfs-sync-update; fi"
+  local raw_base="https://raw.githubusercontent.com/nick-amorim/spoolman-cfs-sync/${BRANCH}/scripts/proxmox"
+  pct exec "$UPDATE_CTID" -- bash -lc "
+    set -Eeuo pipefail
+    if command -v update >/dev/null 2>&1; then
+      update
+    elif command -v spoolman-cfs-sync-update >/dev/null 2>&1; then
+      spoolman-cfs-sync-update
+    else
+      echo '[INFO] Update helper missing; bootstrapping it from GitHub'
+      curl -fsSL '${raw_base}/install-app.sh' -o /tmp/spoolman-cfs-sync-install-app.sh
+      bash /tmp/spoolman-cfs-sync-install-app.sh \
+        --repo '${REPO_URL}' \
+        --branch '${BRANCH}' \
+        --port '${APP_PORT}' \
+        --sync-mode '${SYNC_MODE}'
+    fi
+  "
   ok "Updated ${APP_NAME} in CT ${UPDATE_CTID}"
   exit 0
 }
