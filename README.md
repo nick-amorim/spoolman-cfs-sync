@@ -22,7 +22,7 @@ at the beginning, all usage can be deducted from the wrong Spoolman spool.
 
 - tracking print usage per CFS slot
 - mapping each CFS slot to a Spoolman spool
-- sending one Spoolman usage update per used slot after a print finishes
+- sending Spoolman usage updates per used slot, either after the print or during the print
 - skipping slots that are not mapped
 - preserving local history and safety records to avoid duplicate deductions
 
@@ -32,7 +32,7 @@ This is a working prototype validated against a rooted Creality K1-SE with CFS.
 
 The implementation is intentionally conservative:
 
-- sync is post-print, not live per extrusion
+- sync can run post-print or in live chunks
 - the app sends filament length only, not calculated weight
 - Spoolman remains the source of truth for weight calculations
 - timeout-uncertain writes are never retried automatically
@@ -50,7 +50,7 @@ The implementation is intentionally conservative:
 - searchable Spoolman spool picker
 - per-slot Spoolman spool mapping
 - clear mapping button for empty CFS slots
-- post-print Spoolman usage sync
+- post-print or live Spoolman usage sync
 - recent sync record history
 - manual retry for safe retryable records
 - debug mode for dry-run and local test-data cleanup controls
@@ -74,9 +74,13 @@ T3 -> 1D
 
 Direct slot-style tool commands such as `T1A` are also supported.
 
-When the print finishes, the app creates one sync record per used CFS slot. Each
-record is keyed by the print identity and slot id so the same slot/job is not
-sent twice.
+In post-print mode, the app creates one sync record per used CFS slot when the
+print finishes. Each record is keyed by the print identity and slot id so the
+same slot/job is not sent twice.
+
+In live mode, the app sends usage in chunks while a print is running. The
+default chunk threshold is `100 mm` of new filament per mapped slot. When the
+print finishes, the app sends only the unsynced remainder for each slot.
 
 For a mapped slot, the app calls Spoolman:
 
@@ -212,7 +216,8 @@ The app expects the base Spoolman URL only. It appends `/api/v1` internally.
     "enabled": true,
     "dry_run": false,
     "url": "http://192.168.1.72:7912",
-    "sync_mode": "post_print",
+    "sync_mode": "live",
+    "live_min_delta_mm": 100.0,
     "timeout_sec": 5.0,
     "slot_mappings": {
       "1A": 16,
@@ -271,13 +276,17 @@ Controls Spoolman integration:
 
 - Spoolman URL
 - enable sync
+- sync mode: Post-print or Live
+- live sync threshold in millimeters
 - connection test
 - slot-to-spool mappings
 - recent sync records
 - retry buttons for retryable records
 
 Mapped rows display spool color, id, name, material, and remaining weight when
-Spoolman details are available.
+Spoolman details are available. Live sync records are informational and are not
+manually retryable from the UI; later live chunks or the final record handle
+reconciliation.
 
 ### Debug Mode
 
@@ -363,10 +372,9 @@ Open a pull request into your fork's `main`. The repository is configured for:
 
 ## Current Limitations
 
-- Sync is post-print only.
 - No automatic spool creation in Spoolman.
 - No automatic spool matching by color/material/name.
-- No live per-extrusion Spoolman writes.
+- Live sync is chunked by filament length threshold, not every extrusion move.
 - No automatic compensation for Moonraker native Spoolman deductions.
 - `install.sh` is inherited and should be reviewed before being treated as the
   recommended installer for this fork.

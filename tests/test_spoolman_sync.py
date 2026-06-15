@@ -14,13 +14,15 @@ def state(monkeypatch):
     return st
 
 
-def spoolman_config(*, enabled=False, dry_run=True, mappings=None):
+def spoolman_config(*, enabled=False, dry_run=True, mappings=None, sync_mode="post_print", live_min_delta_mm=100.0):
     cfg = appmod._default_spoolman_config()
     cfg.update(
         {
             "enabled": enabled,
             "dry_run": dry_run,
             "url": "http://spoolman.local:7912",
+            "sync_mode": sync_mode,
+            "live_min_delta_mm": live_min_delta_mm,
         }
     )
     if mappings is not None:
@@ -48,6 +50,8 @@ def test_normalize_spoolman_config_accepts_file_and_normalized_shapes():
             "dry_run": False,
             "url": "http://spoolman.local:7912/",
             "timeout_sec": 99,
+            "sync_mode": "live",
+            "live_min_delta_mm": 0.5,
             "slot_mappings": {"1a": "42", "1B": "", "9Z": 100},
         }
     }
@@ -57,6 +61,8 @@ def test_normalize_spoolman_config_accepts_file_and_normalized_shapes():
     assert normalized["dry_run"] is False
     assert normalized["url"] == "http://spoolman.local:7912"
     assert normalized["timeout_sec"] == 30.0
+    assert normalized["sync_mode"] == "live"
+    assert normalized["live_min_delta_mm"] == 1.0
     assert normalized["slot_mappings"]["1A"] == 42
     assert normalized["slot_mappings"]["1B"] is None
     assert "9Z" not in normalized["slot_mappings"]
@@ -104,6 +110,22 @@ def test_current_job_id_is_best_effort_across_sources():
     assert appmod._moonraker_current_job_id({}, {"uid": "vsd-uid"}) == "vsd-uid"
     assert appmod._moonraker_current_job_id({}, {"cur_print_data": {"id": "cpd-id"}}) == "cpd-id"
     assert appmod._moonraker_current_job_id({}, {}) == ""
+
+
+def test_clear_cfs_connection_removes_stale_printer_data(state):
+    state.cfs_connected = True
+    state.cfs_last_update = 123.0
+    state.cfs_active_slot = "1A"
+    state.cfs_slots = {"1A": {"material": "PLA"}}
+    state.cfs_raw = {"box": {"T1": {}}}
+
+    appmod._clear_cfs_connection(state)
+
+    assert state.cfs_connected is False
+    assert state.cfs_last_update == 123.0
+    assert state.cfs_active_slot is None
+    assert state.cfs_slots == {}
+    assert state.cfs_raw == {}
 
 
 def test_moonraker_build_url_encodes_object_names_with_spaces():
@@ -283,6 +305,111 @@ def test_real_sync_validates_spool_and_posts_length_once(monkeypatch, state):
     assert calls == [(12, 123.4)]
 
 
+def test_live_sync_posts_threshold_chunks_and_checkpoints(monkeypatch, state):
+    calls = []
+    cfg = spoolman_config(
+        enabled=True,
+        dry_run=False,
+        mappings={"1A": 12},
+        sync_mode="live",
+        live_min_delta_mm=100.0,
+    )
+    state.job_track_name = "part.gcode"
+    state.job_track_id = "job-123"
+    state.job_track_started_at = 10
+    state.job_track_slot_mm = {"1A": 150.0}
+    state.job_track_slot_g = {"1A": 1.5}
+    monkeypatch.setattr(appmod, "load_config", lambda: {"spoolman": cfg})
+    monkeypatch.setattr(appmod, "_spoolman_get_spool", lambda spool_id, cfg=None: {"id": spool_id})
+    monkeypatch.setattr(appmod, "_spoolman_use_spool", lambda spool_id, used_mm, cfg=None: calls.append((spool_id, used_mm)) or {})
+
+    appmod._plan_spoolman_live_sync_for_current_job(state)
+
+    assert calls == [(12, 150.0)]
+    assert state.job_track_spoolman_live_synced_mm["1A"] == 150.0
+    rec = state.spoolman_sync_records["moonraker:job-123:1A:live:1"]
+    assert rec["sync_phase"] == "live"
+    assert rec["status"] == "synced"
+
+    appmod._plan_spoolman_live_sync_for_current_job(state)
+    assert calls == [(12, 150.0)]
+
+    state.job_track_slot_mm["1A"] = 230.0
+    state.job_track_slot_g["1A"] = 2.3
+    appmod._plan_spoolman_live_sync_for_current_job(state)
+    assert calls == [(12, 150.0)]
+
+    state.job_track_slot_mm["1A"] = 260.0
+    state.job_track_slot_g["1A"] = 2.6
+    appmod._plan_spoolman_live_sync_for_current_job(state)
+    assert calls == [(12, 150.0), (12, 110.0)]
+    assert state.job_track_spoolman_live_synced_mm["1A"] == 260.0
+
+
+def test_live_final_sync_posts_only_unsynced_remainder(monkeypatch, state):
+    calls = []
+    cfg = spoolman_config(enabled=True, dry_run=False, mappings={"1A": 12}, sync_mode="live")
+    state.job_track_slot_mm = {"1A": 250.0}
+    state.job_track_slot_g = {"1A": 2.5}
+    state.job_track_spoolman_live_synced_mm = {"1A": 200.0}
+    monkeypatch.setattr(appmod, "load_config", lambda: {"spoolman": cfg})
+    monkeypatch.setattr(appmod, "_spoolman_get_spool", lambda spool_id, cfg=None: {"id": spool_id})
+    monkeypatch.setattr(appmod, "_spoolman_use_spool", lambda spool_id, used_mm, cfg=None: calls.append((spool_id, used_mm)) or {})
+
+    appmod._plan_spoolman_sync_for_finished_job(state, "part.gcode", 10, 20, "complete", job_id="job-123")
+
+    assert calls == [(12, 50.0)]
+    rec = state.spoolman_sync_records["moonraker:job-123:1A:final"]
+    assert rec["sync_phase"] == "final"
+    assert rec["used_mm"] == 50.0
+    assert rec["status"] == "synced"
+
+
+def test_live_final_sync_caps_parser_total_to_printer_reported_total(monkeypatch, state):
+    calls = []
+    cfg = spoolman_config(enabled=True, dry_run=False, mappings={"1C": 1}, sync_mode="live")
+    state.job_track_slot_mm = {"1C": 9084.64}
+    state.job_track_slot_g = {"1C": 27.1}
+    state.job_track_spoolman_live_synced_mm = {"1C": 311.814}
+    monkeypatch.setattr(appmod, "load_config", lambda: {"spoolman": cfg})
+    monkeypatch.setattr(appmod, "_spoolman_get_spool", lambda spool_id, cfg=None: {"id": spool_id})
+    monkeypatch.setattr(appmod, "_spoolman_use_spool", lambda spool_id, used_mm, cfg=None: calls.append((spool_id, used_mm)) or {})
+
+    appmod._plan_spoolman_sync_for_finished_job(
+        state,
+        "10x5mm-magnet-dispenser-barrel_PLA_1h17m.gcode",
+        10,
+        20,
+        "complete",
+        printer_total_mm=7683.44,
+    )
+
+    assert calls == [(1, pytest.approx(7371.626, abs=0.001))]
+    rec = state.spoolman_sync_records["local:10x5mm-magnet-dispenser-barrel_PLA_1h17m.gcode:10:20:1C:final"]
+    assert rec["sync_phase"] == "final"
+    assert rec["used_mm"] == pytest.approx(7371.626, abs=0.001)
+
+
+def test_live_uncertain_record_blocks_final_reconciliation(monkeypatch, state):
+    calls = []
+    cfg = spoolman_config(enabled=True, dry_run=False, mappings={"1A": 12}, sync_mode="live")
+    state.job_track_slot_mm = {"1A": 250.0}
+    state.job_track_slot_g = {"1A": 2.5}
+    state.job_track_spoolman_live_synced_mm = {"1A": 150.0}
+    state.job_track_spoolman_live_blocked = {"1A": {"status": "timeout_uncertain"}}
+    monkeypatch.setattr(appmod, "load_config", lambda: {"spoolman": cfg})
+    monkeypatch.setattr(appmod, "_spoolman_get_spool", lambda spool_id, cfg=None: {"id": spool_id})
+    monkeypatch.setattr(appmod, "_spoolman_use_spool", lambda spool_id, used_mm, cfg=None: calls.append((spool_id, used_mm)) or {})
+
+    appmod._plan_spoolman_sync_for_finished_job(state, "part.gcode", 10, 20, "complete", job_id="job-123")
+
+    assert calls == []
+    rec = state.spoolman_sync_records["moonraker:job-123:1A:final"]
+    assert rec["sync_phase"] == "final"
+    assert rec["status"] == "timeout_uncertain"
+    assert rec["used_mm"] == 100.0
+
+
 @pytest.mark.parametrize(
     ("payload", "expected"),
     [
@@ -380,6 +507,20 @@ def test_timeout_uncertain_record_is_not_ui_retryable(monkeypatch, state):
 
     assert exc.value.status_code == 409
     assert "not automatically retryable" in exc.value.detail
+
+
+def test_live_sync_record_is_not_ui_retryable(monkeypatch, state):
+    key = "moonraker:job-123:1A:live:1"
+    rec = make_record(status="failed")
+    rec["sync_phase"] = "live"
+    state.spoolman_sync_records[key] = rec
+    monkeypatch.setattr(appmod, "load_state", lambda: state)
+
+    with pytest.raises(HTTPException) as exc:
+        appmod.api_ui_spoolman_retry(UiSpoolmanRetryRequest(record_key=key))
+
+    assert exc.value.status_code == 409
+    assert "Live sync records" in exc.value.detail
 
 
 def test_skipped_unmapped_retry_uses_current_mapping(monkeypatch, state):
