@@ -137,6 +137,58 @@ def test_moonraker_build_url_encodes_object_names_with_spaces():
     assert url == "http://printer.local:7125/printer/objects/query?print_stats&gcode_macro%20SET_ACTIVE_SPOOL"
 
 
+def test_moonraker_native_spoolman_without_active_spool_has_no_warning(monkeypatch):
+    def fake_get(url, timeout=5.0):
+        if url.endswith("/server/info"):
+            return {"result": {"components": ["database", "spoolman"]}}
+        if url.endswith("/server/config"):
+            return {"result": {"config": {"spoolman": {"server": "http://spoolman.local:7912"}}}}
+        if url.endswith("/server/spoolman/status"):
+            return {"result": {"spoolman_connected": True, "spool_id": None}}
+        raise AssertionError(url)
+
+    monkeypatch.setattr(appmod, "_http_get_json", fake_get)
+
+    detected, warning = appmod._moonraker_detect_native_spoolman("http://printer.local:7125")
+
+    assert detected is True
+    assert warning == ""
+
+
+def test_moonraker_native_spoolman_with_active_spool_warns(monkeypatch):
+    def fake_get(url, timeout=5.0):
+        if url.endswith("/server/info"):
+            return {"result": {"components": ["spoolman"]}}
+        if url.endswith("/server/config"):
+            return {"result": {}}
+        if url.endswith("/server/spoolman/status"):
+            return {"result": {"spoolman_connected": True, "spool_id": 16}}
+        raise AssertionError(url)
+
+    monkeypatch.setattr(appmod, "_http_get_json", fake_get)
+
+    detected, warning = appmod._moonraker_detect_native_spoolman("http://printer.local:7125")
+
+    assert detected is True
+    assert "active spool selected" in warning
+
+
+def test_moonraker_native_spoolman_not_installed_has_no_warning(monkeypatch):
+    def fake_get(url, timeout=5.0):
+        if url.endswith("/server/info"):
+            return {"result": {"components": ["database"]}}
+        if url.endswith("/server/config"):
+            return {"result": {"config": {}}}
+        raise AssertionError(url)
+
+    monkeypatch.setattr(appmod, "_http_get_json", fake_get)
+
+    detected, warning = appmod._moonraker_detect_native_spoolman("http://printer.local:7125")
+
+    assert detected is False
+    assert warning == ""
+
+
 def test_gcode_parser_maps_orca_tool_indexes_to_cfs_slots(monkeypatch, state):
     monkeypatch.setattr(appmod, "mm_to_g", lambda material, mm: mm / 100.0)
 

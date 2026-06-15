@@ -1494,17 +1494,25 @@ def _clear_cfs_connection(state: AppState) -> None:
 
 
 def _moonraker_detect_native_spoolman(base: str) -> tuple[bool, str]:
-    """Best-effort detection of Moonraker's native Spoolman component."""
+    """Best-effort detection of Moonraker's native Spoolman component.
+
+    Moonraker can have the Spoolman component installed without an active spool
+    selected. That is useful to report internally, but it is not a
+    double-accounting risk until Moonraker has a spool associated.
+    """
     warning = (
-        "Moonraker Spoolman integration detected. This may cause double-accounting "
-        "if Moonraker and spoolman-cfs-sync both deduct filament usage."
+        "Moonraker Spoolman integration has an active spool selected. This may "
+        "cause double-accounting if Moonraker and spoolman-cfs-sync both deduct "
+        "filament usage."
     )
+    detected = False
+
     try:
         info = _http_get_json(base.rstrip("/") + "/server/info", timeout=2.5)
         result = (info or {}).get("result") or {}
         comps = result.get("components")
         if isinstance(comps, list) and any(str(c).lower() == "spoolman" for c in comps):
-            return True, warning
+            detected = True
     except Exception:
         pass
 
@@ -1512,11 +1520,22 @@ def _moonraker_detect_native_spoolman(base: str) -> tuple[bool, str]:
         cfg = _http_get_json(base.rstrip("/") + "/server/config", timeout=2.5)
         raw = json.dumps(cfg or {}).lower()
         if '"spoolman"' in raw or "[spoolman]" in raw:
-            return True, warning
+            detected = True
     except Exception:
         pass
 
-    return False, ""
+    if not detected:
+        return False, ""
+
+    try:
+        status = _http_get_json(base.rstrip("/") + "/server/spoolman/status", timeout=2.5)
+        result = (status or {}).get("result") or {}
+        spool_id = result.get("spool_id")
+        if spool_id not in (None, "", 0, "0"):
+            return True, warning
+        return True, ""
+    except Exception:
+        return True, ""
 
 
 def _walk(obj, path=""):
