@@ -398,6 +398,32 @@ def test_live_sync_posts_threshold_chunks_and_checkpoints(monkeypatch, state):
     assert state.job_track_spoolman_live_synced_mm["1A"] == 260.0
 
 
+def test_live_sync_caps_parser_usage_to_printer_reported_total(monkeypatch, state):
+    calls = []
+    cfg = spoolman_config(
+        enabled=True,
+        dry_run=False,
+        mappings={"1A": 16, "1D": 10},
+        sync_mode="live",
+        live_min_delta_mm=1.0,
+    )
+    state.current_job_filament_mm = 200.0
+    state.job_track_name = "part.gcode"
+    state.job_track_id = "job-123"
+    state.job_track_started_at = 10
+    state.job_track_slot_mm = {"1A": 100.0, "1D": 300.0}
+    state.job_track_slot_g = {"1A": 1.0, "1D": 3.0}
+    monkeypatch.setattr(appmod, "load_config", lambda: {"spoolman": cfg})
+    monkeypatch.setattr(appmod, "_spoolman_get_spool", lambda spool_id, cfg=None: {"id": spool_id})
+    monkeypatch.setattr(appmod, "_spoolman_use_spool", lambda spool_id, used_mm, cfg=None: calls.append((spool_id, used_mm)) or {})
+
+    appmod._plan_spoolman_live_sync_for_current_job(state)
+
+    assert calls == [(16, 50.0), (10, 150.0)]
+    assert state.job_track_spoolman_live_synced_mm["1A"] == 50.0
+    assert state.job_track_spoolman_live_synced_mm["1D"] == 150.0
+
+
 def test_live_final_sync_posts_only_unsynced_remainder(monkeypatch, state):
     calls = []
     cfg = spoolman_config(enabled=True, dry_run=False, mappings={"1A": 12}, sync_mode="live")

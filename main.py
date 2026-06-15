@@ -1177,6 +1177,14 @@ def _plan_spoolman_live_sync_for_current_job(state: AppState) -> None:
     mappings = cfg.get("slot_mappings") if isinstance(cfg.get("slot_mappings"), dict) else {}
     synced, attempted, seqs, blocked = _live_spoolman_maps(state)
     min_delta = float(cfg.get("live_min_delta_mm", 100.0) or 100.0)
+    scale = 1.0
+    try:
+        parsed_total_mm = sum(max(0.0, float(v or 0.0)) for v in slot_mm.values())
+        printer_total_mm = float(getattr(state, "current_job_filament_mm", 0.0) or 0.0)
+        if parsed_total_mm > 0 and 0 < printer_total_mm < parsed_total_mm:
+            scale = printer_total_mm / parsed_total_mm
+    except Exception:
+        scale = 1.0
     changed = False
 
     for sid, total_val in slot_mm.items():
@@ -1189,7 +1197,7 @@ def _plan_spoolman_live_sync_for_current_job(state: AppState) -> None:
         if not spool_id:
             continue
         try:
-            total_mm = float(total_val or 0.0)
+            total_mm = float(total_val or 0.0) * scale
             synced_mm = float(synced.get(sid_s, 0.0) or 0.0)
             attempted_mm = float(attempted.get(sid_s, 0.0) or 0.0)
         except Exception:
