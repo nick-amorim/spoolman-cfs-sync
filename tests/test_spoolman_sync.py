@@ -137,6 +137,58 @@ def test_moonraker_build_url_encodes_object_names_with_spaces():
     assert url == "http://printer.local:7125/printer/objects/query?print_stats&gcode_macro%20SET_ACTIVE_SPOOL"
 
 
+def test_moonraker_native_spoolman_without_active_spool_has_no_warning(monkeypatch):
+    def fake_get(url, timeout=5.0):
+        if url.endswith("/server/info"):
+            return {"result": {"components": ["database", "spoolman"]}}
+        if url.endswith("/server/config"):
+            return {"result": {"config": {"spoolman": {"server": "http://spoolman.local:7912"}}}}
+        if url.endswith("/server/spoolman/status"):
+            return {"result": {"spoolman_connected": True, "spool_id": None}}
+        raise AssertionError(url)
+
+    monkeypatch.setattr(appmod, "_http_get_json", fake_get)
+
+    detected, warning = appmod._moonraker_detect_native_spoolman("http://printer.local:7125")
+
+    assert detected is True
+    assert warning == ""
+
+
+def test_moonraker_native_spoolman_with_active_spool_warns(monkeypatch):
+    def fake_get(url, timeout=5.0):
+        if url.endswith("/server/info"):
+            return {"result": {"components": ["spoolman"]}}
+        if url.endswith("/server/config"):
+            return {"result": {}}
+        if url.endswith("/server/spoolman/status"):
+            return {"result": {"spoolman_connected": True, "spool_id": 16}}
+        raise AssertionError(url)
+
+    monkeypatch.setattr(appmod, "_http_get_json", fake_get)
+
+    detected, warning = appmod._moonraker_detect_native_spoolman("http://printer.local:7125")
+
+    assert detected is True
+    assert "active spool selected" in warning
+
+
+def test_moonraker_native_spoolman_not_installed_has_no_warning(monkeypatch):
+    def fake_get(url, timeout=5.0):
+        if url.endswith("/server/info"):
+            return {"result": {"components": ["database"]}}
+        if url.endswith("/server/config"):
+            return {"result": {"config": {}}}
+        raise AssertionError(url)
+
+    monkeypatch.setattr(appmod, "_http_get_json", fake_get)
+
+    detected, warning = appmod._moonraker_detect_native_spoolman("http://printer.local:7125")
+
+    assert detected is False
+    assert warning == ""
+
+
 def test_gcode_parser_maps_orca_tool_indexes_to_cfs_slots(monkeypatch, state):
     monkeypatch.setattr(appmod, "mm_to_g", lambda material, mm: mm / 100.0)
 
@@ -344,6 +396,32 @@ def test_live_sync_posts_threshold_chunks_and_checkpoints(monkeypatch, state):
     appmod._plan_spoolman_live_sync_for_current_job(state)
     assert calls == [(12, 150.0), (12, 110.0)]
     assert state.job_track_spoolman_live_synced_mm["1A"] == 260.0
+
+
+def test_live_sync_caps_parser_usage_to_printer_reported_total(monkeypatch, state):
+    calls = []
+    cfg = spoolman_config(
+        enabled=True,
+        dry_run=False,
+        mappings={"1A": 16, "1D": 10},
+        sync_mode="live",
+        live_min_delta_mm=1.0,
+    )
+    state.current_job_filament_mm = 200.0
+    state.job_track_name = "part.gcode"
+    state.job_track_id = "job-123"
+    state.job_track_started_at = 10
+    state.job_track_slot_mm = {"1A": 100.0, "1D": 300.0}
+    state.job_track_slot_g = {"1A": 1.0, "1D": 3.0}
+    monkeypatch.setattr(appmod, "load_config", lambda: {"spoolman": cfg})
+    monkeypatch.setattr(appmod, "_spoolman_get_spool", lambda spool_id, cfg=None: {"id": spool_id})
+    monkeypatch.setattr(appmod, "_spoolman_use_spool", lambda spool_id, used_mm, cfg=None: calls.append((spool_id, used_mm)) or {})
+
+    appmod._plan_spoolman_live_sync_for_current_job(state)
+
+    assert calls == [(16, 50.0), (10, 150.0)]
+    assert state.job_track_spoolman_live_synced_mm["1A"] == 50.0
+    assert state.job_track_spoolman_live_synced_mm["1D"] == 150.0
 
 
 def test_live_final_sync_posts_only_unsynced_remainder(monkeypatch, state):

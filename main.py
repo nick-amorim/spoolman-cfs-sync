@@ -281,7 +281,7 @@ def _ensure_data_files() -> None:
             json.dumps(
                 {
                     # Optional: set this to enable automatic job usage reading from Moonraker
-                    # Example: "http://192.168.178.148:7125"
+                    # Example: "http://PRINTER_IP:7125"
                     "moonraker_url": "",
                     "poll_interval_sec": 5,
                     # Filament diameter used for mm->g conversion
@@ -1177,6 +1177,14 @@ def _plan_spoolman_live_sync_for_current_job(state: AppState) -> None:
     mappings = cfg.get("slot_mappings") if isinstance(cfg.get("slot_mappings"), dict) else {}
     synced, attempted, seqs, blocked = _live_spoolman_maps(state)
     min_delta = float(cfg.get("live_min_delta_mm", 100.0) or 100.0)
+    scale = 1.0
+    try:
+        parsed_total_mm = sum(max(0.0, float(v or 0.0)) for v in slot_mm.values())
+        printer_total_mm = float(getattr(state, "current_job_filament_mm", 0.0) or 0.0)
+        if parsed_total_mm > 0 and 0 < printer_total_mm < parsed_total_mm:
+            scale = printer_total_mm / parsed_total_mm
+    except Exception:
+        scale = 1.0
     changed = False
 
     for sid, total_val in slot_mm.items():
@@ -1189,7 +1197,7 @@ def _plan_spoolman_live_sync_for_current_job(state: AppState) -> None:
         if not spool_id:
             continue
         try:
-            total_mm = float(total_val or 0.0)
+            total_mm = float(total_val or 0.0) * scale
             synced_mm = float(synced.get(sid_s, 0.0) or 0.0)
             attempted_mm = float(attempted.get(sid_s, 0.0) or 0.0)
         except Exception:
@@ -1449,7 +1457,7 @@ def _moonraker_build_url(base: str, objects: list[str]) -> str:
     """Build Moonraker objects/query URL.
 
     Moonraker supports multiple syntaxes depending on version/vendor fork.
-    Creality K-series (K2 Plus) reliably supports the ampersand form:
+    Creality K-series firmware reliably supports the ampersand form:
       /printer/objects/query?print_stats&virtual_sdcard&box&filament_rack
 
     Some upstream versions also accept `objects=toolhead,print_stats`, but that
@@ -1473,7 +1481,7 @@ def _moonraker_cfs_objects(base: str) -> list[str]:
         lo = str(o).lower()
         if any(x in lo for x in ("cfs", "ams", "mmu", "spool", "filament_box", "filamentbox")):
             cfs_objects.append(str(o))
-        # Creality K-series / K2 Plus objects
+        # Creality K-series / CFS objects
         if lo in ("box", "filament_rack"):
             cfs_objects.append(str(o))
     seen: set[str] = set()
@@ -1494,17 +1502,25 @@ def _clear_cfs_connection(state: AppState) -> None:
 
 
 def _moonraker_detect_native_spoolman(base: str) -> tuple[bool, str]:
-    """Best-effort detection of Moonraker's native Spoolman component."""
+    """Best-effort detection of Moonraker's native Spoolman component.
+
+    Moonraker can have the Spoolman component installed without an active spool
+    selected. That is useful to report internally, but it is not a
+    double-accounting risk until Moonraker has a spool associated.
+    """
     warning = (
-        "Moonraker Spoolman integration detected. This may cause double-accounting "
-        "if Moonraker and spoolman-cfs-sync both deduct filament usage."
+        "Moonraker Spoolman integration has an active spool selected. This may "
+        "cause double-accounting if Moonraker and spoolman-cfs-sync both deduct "
+        "filament usage."
     )
+    detected = False
+
     try:
         info = _http_get_json(base.rstrip("/") + "/server/info", timeout=2.5)
         result = (info or {}).get("result") or {}
         comps = result.get("components")
         if isinstance(comps, list) and any(str(c).lower() == "spoolman" for c in comps):
-            return True, warning
+            detected = True
     except Exception:
         pass
 
@@ -1512,11 +1528,22 @@ def _moonraker_detect_native_spoolman(base: str) -> tuple[bool, str]:
         cfg = _http_get_json(base.rstrip("/") + "/server/config", timeout=2.5)
         raw = json.dumps(cfg or {}).lower()
         if '"spoolman"' in raw or "[spoolman]" in raw:
-            return True, warning
+            detected = True
     except Exception:
         pass
 
-    return False, ""
+    if not detected:
+        return False, ""
+
+    try:
+        status = _http_get_json(base.rstrip("/") + "/server/spoolman/status", timeout=2.5)
+        result = (status or {}).get("result") or {}
+        spool_id = result.get("spool_id")
+        if spool_id not in (None, "", 0, "0"):
+            return True, warning
+        return True, ""
+    except Exception:
+        return True, ""
 
 
 def _walk(obj, path=""):
@@ -1547,7 +1574,7 @@ def _extract_cfs_slot_data(status: dict) -> tuple[Optional[str], dict]:
     active = None
     slots: dict[str, dict] = {}
 
-    # --- Creality K-series "box" + "filament_rack" objects (K2 Plus / CFS) ---
+    # --- Creality K-series "box" + "filament_rack" objects (CFS) ---
     # Firmware exposes:
     #   box.T1..T4 with arrays: color_value/material_type/remain_len, and box.<Tn>.filament = "A".."D"
     #   filament_rack.remain_material_color/type
@@ -2077,7 +2104,7 @@ async def _restart_moonraker_poll_task() -> None:
 
 
 
-app = FastAPI(title="3D Printer Filament Manager", version="0.1.1")
+app = FastAPI(title="spoolman-cfs-sync", version="0.1.1")
 
 
 @app.middleware("http")
