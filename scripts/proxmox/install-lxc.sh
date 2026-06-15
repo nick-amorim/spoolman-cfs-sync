@@ -76,8 +76,8 @@ Examples:
 
   bash <(curl -fsSL https://raw.githubusercontent.com/nick-amorim/spoolman-cfs-sync/main/scripts/proxmox/install-lxc.sh) \\
     --ctid 120 --storage local-lvm --bridge vmbr0 \\
-    --moonraker-url http://192.168.1.12:7125 \\
-    --spoolman-url http://192.168.1.72:7912
+    --moonraker-url http://PRINTER_IP:7125 \\
+    --spoolman-url http://SPOOLMAN_IP:7912
 
   bash <(curl -fsSL https://raw.githubusercontent.com/nick-amorim/spoolman-cfs-sync/main/scripts/proxmox/install-lxc.sh) --update 120
 EOF

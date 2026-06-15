@@ -281,7 +281,7 @@ def _ensure_data_files() -> None:
             json.dumps(
                 {
                     # Optional: set this to enable automatic job usage reading from Moonraker
-                    # Example: "http://192.168.178.148:7125"
+                    # Example: "http://PRINTER_IP:7125"
                     "moonraker_url": "",
                     "poll_interval_sec": 5,
                     # Filament diameter used for mm->g conversion
@@ -1449,7 +1449,7 @@ def _moonraker_build_url(base: str, objects: list[str]) -> str:
     """Build Moonraker objects/query URL.
 
     Moonraker supports multiple syntaxes depending on version/vendor fork.
-    Creality K-series (K2 Plus) reliably supports the ampersand form:
+    Creality K-series firmware reliably supports the ampersand form:
       /printer/objects/query?print_stats&virtual_sdcard&box&filament_rack
 
     Some upstream versions also accept `objects=toolhead,print_stats`, but that
@@ -1473,7 +1473,7 @@ def _moonraker_cfs_objects(base: str) -> list[str]:
         lo = str(o).lower()
         if any(x in lo for x in ("cfs", "ams", "mmu", "spool", "filament_box", "filamentbox")):
             cfs_objects.append(str(o))
-        # Creality K-series / K2 Plus objects
+        # Creality K-series / CFS objects
         if lo in ("box", "filament_rack"):
             cfs_objects.append(str(o))
     seen: set[str] = set()
@@ -1566,7 +1566,7 @@ def _extract_cfs_slot_data(status: dict) -> tuple[Optional[str], dict]:
     active = None
     slots: dict[str, dict] = {}
 
-    # --- Creality K-series "box" + "filament_rack" objects (K2 Plus / CFS) ---
+    # --- Creality K-series "box" + "filament_rack" objects (CFS) ---
     # Firmware exposes:
     #   box.T1..T4 with arrays: color_value/material_type/remain_len, and box.<Tn>.filament = "A".."D"
     #   filament_rack.remain_material_color/type
@@ -2096,7 +2096,7 @@ async def _restart_moonraker_poll_task() -> None:
 
 
 
-app = FastAPI(title="3D Printer Filament Manager", version="0.1.1")
+app = FastAPI(title="spoolman-cfs-sync", version="0.1.1")
 
 
 @app.middleware("http")

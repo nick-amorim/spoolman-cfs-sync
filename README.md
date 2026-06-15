@@ -177,9 +177,8 @@ python -m pip install -r requirements.txt
 python -m uvicorn main:app --host 0.0.0.0 --port 8005
 ```
 
-The inherited `install.sh` still needs a dedicated pass before it should be used
-as the recommended installer for this fork. Manual startup is the safest path
-for now.
+Manual startup is useful for development or non-Proxmox Linux installs. For an
+always-on deployment, prefer the Proxmox LXC helper below.
 
 ## Proxmox LXC Deployment
 
@@ -198,8 +197,8 @@ With initial printer and Spoolman URLs:
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/nick-amorim/spoolman-cfs-sync/main/scripts/proxmox/install-lxc.sh) \
-  --moonraker-url http://192.168.1.12:7125 \
-  --spoolman-url http://192.168.1.72:7912
+  --moonraker-url http://PRINTER_IP:7125 \
+  --spoolman-url http://SPOOLMAN_IP:7912
 ```
 
 The installer creates a Debian LXC, installs the app as a systemd service, and
@@ -231,14 +230,14 @@ from the web UI.
 
 Open **Settings** and set:
 
-- Moonraker URL, for example `http://192.168.1.12:7125`
+- Moonraker URL, for example `http://PRINTER_IP:7125`
 - Poll interval, usually `5`
 - Filament diameter, usually `1.75`
 - whether to import CFS material, color, and name into local slots
 
 Then use the **Spoolman Sync** panel:
 
-1. Enter your Spoolman base URL, for example `http://192.168.1.72:7912`.
+1. Enter your Spoolman base URL, for example `http://SPOOLMAN_IP:7912`.
 2. Click **Test**.
 3. Enable sync.
 4. For each CFS slot, click **Select Spool**.
@@ -251,14 +250,14 @@ The app expects the base Spoolman URL only. It appends `/api/v1` internally.
 
 ```json
 {
-  "moonraker_url": "http://192.168.1.12:7125",
+  "moonraker_url": "http://PRINTER_IP:7125",
   "poll_interval_sec": 5.0,
   "filament_diameter_mm": 1.75,
   "cfs_autosync": true,
   "spoolman": {
     "enabled": true,
     "dry_run": false,
-    "url": "http://192.168.1.72:7912",
+    "url": "http://SPOOLMAN_IP:7912",
     "sync_mode": "live",
     "live_min_delta_mm": 100.0,
     "timeout_sec": 5.0,
@@ -342,14 +341,15 @@ Normal use should keep debug mode off.
 
 ## Native Moonraker Spoolman Warning
 
-If Moonraker's native Spoolman integration is enabled at the same time as this
-app, filament can be deducted twice:
+If Moonraker's native Spoolman integration has an active spool selected at the
+same time as this app, filament can be deducted twice:
 
 1. Moonraker deducts from its single active spool.
 2. `spoolman-cfs-sync` deducts from each mapped CFS slot.
 
-The app shows a warning when it detects native Moonraker Spoolman integration.
-For production use, avoid having both systems deduct the same print.
+The app shows a warning only when Moonraker reports an active native Spoolman
+spool. If the component is installed but no spool is selected in Moonraker, no
+warning is shown.
 
 ## Testing
 
@@ -374,7 +374,7 @@ python -m py_compile main.py models\schemas.py
 Known local passing result:
 
 ```text
-29 passed
+38 passed
 ```
 
 GitHub Actions also runs the test suite on pull requests and pushes.
@@ -420,8 +420,6 @@ Open a pull request into your fork's `main`. The repository is configured for:
 - No automatic spool matching by color/material/name.
 - Live sync is chunked by filament length threshold, not every extrusion move.
 - No automatic compensation for Moonraker native Spoolman deductions.
-- `install.sh` is inherited and should be reviewed before being treated as the
-  recommended installer for this fork.
 
 ## Credits
 

@@ -45,8 +45,8 @@ bash <(curl -fsSL https://raw.githubusercontent.com/nick-amorim/spoolman-cfs-syn
   --hostname spoolman-cfs-sync \
   --storage local-lvm \
   --bridge vmbr0 \
-  --moonraker-url http://192.168.1.12:7125 \
-  --spoolman-url http://192.168.1.72:7912
+  --moonraker-url http://PRINTER_IP:7125 \
+  --spoolman-url http://SPOOLMAN_IP:7912
 ```
 
 The installer writes those URLs into `data/config.json`, but Spoolman writes
