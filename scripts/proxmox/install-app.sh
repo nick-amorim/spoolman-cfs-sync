@@ -98,6 +98,7 @@ create_user() {
 
 clone_or_update_repo() {
   if [[ -d "${APP_DIR}/.git" ]]; then
+    run_quiet "Trusting app repository for Git" git config --global --add safe.directory "$APP_DIR"
     run_quiet "Fetching repository updates" git -C "$APP_DIR" fetch --prune origin
     run_quiet "Checking out ${BRANCH}" git -C "$APP_DIR" checkout "$BRANCH"
     run_quiet "Resetting app to origin/${BRANCH}" git -C "$APP_DIR" reset --hard "origin/${BRANCH}"
@@ -237,6 +238,7 @@ fi
 
 info "Updating ${SERVICE_NAME} from origin/${BRANCH}"
 cd "$APP_DIR"
+run_quiet "Trusting app repository for Git" git config --global --add safe.directory "$APP_DIR"
 run_quiet "Fetching repository updates" git fetch --prune origin
 run_quiet "Checking out ${BRANCH}" git checkout "$BRANCH"
 run_quiet "Resetting app to origin/${BRANCH}" git reset --hard "origin/${BRANCH}"
