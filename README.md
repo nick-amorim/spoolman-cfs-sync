@@ -181,6 +181,49 @@ The inherited `install.sh` still needs a dedicated pass before it should be used
 as the recommended installer for this fork. Manual startup is the safest path
 for now.
 
+## Proxmox LXC Deployment
+
+For an always-on install near your printer, use the Proxmox LXC helper script.
+Run this from the Proxmox host shell as `root`:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/nick-amorim/spoolman-cfs-sync/main/scripts/proxmox/install-lxc.sh)
+```
+
+The installer suggests the next available CTID and default resources. Accept the
+default install or choose advanced mode to change CTID, memory, storage, network,
+and related settings.
+
+With initial printer and Spoolman URLs:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/nick-amorim/spoolman-cfs-sync/main/scripts/proxmox/install-lxc.sh) \
+  --moonraker-url http://192.168.1.12:7125 \
+  --spoolman-url http://192.168.1.72:7912
+```
+
+The installer creates a Debian LXC, installs the app as a systemd service, and
+adds an update helper inside the container:
+
+```bash
+update
+```
+
+`spoolman-cfs-sync-update` is also available as the explicit app-specific
+updater.
+
+From the Proxmox host, update an existing container with:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/nick-amorim/spoolman-cfs-sync/main/scripts/proxmox/install-lxc.sh) --update 120
+```
+
+`120` is the CTID of the existing LXC. Replace it with the container ID shown
+after install.
+
+See [scripts/proxmox/README.md](scripts/proxmox/README.md) for advanced options,
+static IP configuration, service commands, and safety notes.
+
 ## First Configuration
 
 The app creates `data/config.json` on first run. You can configure most settings
@@ -365,6 +408,7 @@ Open a pull request into your fork's `main`. The repository is configured for:
 | `static/index.html` | Main UI shell. |
 | `static/app.js` | Browser UI behavior. |
 | `static/style.css` | UI styling. |
+| `scripts/proxmox/` | Proxmox LXC installer and update helper scripts. |
 | `data/config.json` | Local runtime config, ignored by Git. |
 | `data/state.json` | Local runtime state, ignored by Git. |
 | `tests/test_spoolman_sync.py` | Regression tests for sync and parser behavior. |
