@@ -613,6 +613,16 @@ function spoolmanStatusLabel(status) {
   return s || "unknown";
 }
 
+function printerErrorLabel(err) {
+  const s = String(err || "").trim().toLowerCase();
+  if (!s) return "";
+  if (s.includes("timed out") || s.includes("timeout")) return "connection timed out";
+  if (s.includes("connection refused")) return "connection refused";
+  if (s.includes("no route to host") || s.includes("network is unreachable")) return "network unreachable";
+  if (s.includes("name or service not known") || s.includes("getaddrinfo")) return "host not found";
+  return "connection error";
+}
+
 function renderSpoolman(state, connectedBoxes, slots) {
   const panel = $("spoolmanPanel");
   const meta = $("spoolmanMeta");
@@ -838,10 +848,11 @@ function renderSpoolman(state, connectedBoxes, slots) {
 function render(state) {
   latestState = state;
   const printerOk = !!state.printer_connected;
-  badge($("printerBadge"), printerOk ? "Printer: connected" : "Printer: disconnected", printerOk ? "ok" : "bad");
-  if (!printerOk && state.printer_last_error && $("printerBadge")) $("printerBadge").textContent += " (" + state.printer_last_error + ")";
+  const printerErr = printerErrorLabel(state.printer_last_error);
+  badge($("printerBadge"), printerOk ? "Printer: connected" : `Printer: disconnected${printerErr ? " - " + printerErr : ""}`, printerOk ? "ok" : "bad");
   const cfsOk = !!state.cfs_connected;
-  badge($("cfsBadge"), cfsOk ? ("CFS: detected - " + fmtTs(state.cfs_last_update)) : "CFS: -", cfsOk ? "ok" : "warn");
+  const cfsText = cfsOk ? ("CFS: detected - " + fmtTs(state.cfs_last_update)) : (printerOk ? "CFS: not detected" : "CFS: disconnected");
+  badge($("cfsBadge"), cfsText, cfsOk ? "ok" : "warn");
 
   const slots = (state.cfs_slots && Object.keys(state.cfs_slots).length) ? state.cfs_slots : state.slots;
   const connectedBoxes = connectedBoxesFor(slots);

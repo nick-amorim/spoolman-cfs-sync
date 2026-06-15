@@ -1245,6 +1245,7 @@ def _plan_spoolman_sync_for_finished_job(
     end_ts: float,
     result: str,
     job_id: Optional[str] = None,
+    printer_total_mm: Optional[float] = None,
 ) -> None:
     cfg = _normalize_spoolman_config(load_config())
     if not (bool(cfg.get("dry_run", True)) or bool(cfg.get("enabled", False))):
@@ -1257,11 +1258,19 @@ def _plan_spoolman_sync_for_finished_job(
     live_mode = str(cfg.get("sync_mode") or "") == "live"
     live_job_key = _live_spoolman_print_key(job_name, start_ts, job_id=job_id)
     live_synced, _, _, live_blocked = _live_spoolman_maps(state)
+    scale = 1.0
+    try:
+        parsed_total_mm = sum(max(0.0, float(v or 0.0)) for v in slot_mm.values())
+        printer_total = float(printer_total_mm or 0.0)
+        if printer_total > 0 and parsed_total_mm > printer_total:
+            scale = max(0.0, min(1.0, printer_total / parsed_total_mm))
+    except Exception:
+        scale = 1.0
 
     for sid, mm_val in slot_mm.items():
         sid_s = str(sid).strip().upper()
         try:
-            total_mm = float(mm_val or 0.0)
+            total_mm = float(mm_val or 0.0) * scale
         except Exception:
             total_mm = 0.0
         if total_mm <= 0:
@@ -1455,6 +1464,33 @@ def _moonraker_build_url(base: str, objects: list[str]) -> str:
 def _moonraker_list_objects(base: str) -> list[str]:
     data = _http_get_json(base.rstrip("/") + "/printer/objects/list")
     return list((((data or {}).get("result") or {}).get("objects") or []))
+
+
+def _moonraker_cfs_objects(base: str) -> list[str]:
+    cfs_objects: list[str] = []
+    objs = _moonraker_list_objects(base)
+    for o in objs:
+        lo = str(o).lower()
+        if any(x in lo for x in ("cfs", "ams", "mmu", "spool", "filament_box", "filamentbox")):
+            cfs_objects.append(str(o))
+        # Creality K-series / K2 Plus objects
+        if lo in ("box", "filament_rack"):
+            cfs_objects.append(str(o))
+    seen: set[str] = set()
+    out: list[str] = []
+    for obj in cfs_objects:
+        if obj in seen:
+            continue
+        seen.add(obj)
+        out.append(obj)
+    return out[:12]
+
+
+def _clear_cfs_connection(state: AppState) -> None:
+    state.cfs_connected = False
+    state.cfs_active_slot = None
+    state.cfs_slots = {}
+    state.cfs_raw = {}
 
 
 def _moonraker_detect_native_spoolman(base: str) -> tuple[bool, str]:
@@ -1700,21 +1736,13 @@ async def moonraker_poll_loop() -> None:
     # Best-effort: discover CFS-related objects once, then include them in polling.
     cfs_objects: list[str] = []
     try:
-        objs = await asyncio.to_thread(_moonraker_list_objects, base)
-        for o in objs:
-            lo = str(o).lower()
-            if any(x in lo for x in ("cfs", "ams", "mmu", "spool", "filament_box", "filamentbox")):
-                cfs_objects.append(str(o))
-            # Creality K-series / K2 Plus objects
-            if lo in ("box", "filament_rack"):
-                cfs_objects.append(str(o))
-        # Keep the poll URL reasonably short
-        cfs_objects = cfs_objects[:12]
+        cfs_objects = await asyncio.to_thread(_moonraker_cfs_objects, base)
     except Exception:
         cfs_objects = []
 
     poll_objects = base_objects + cfs_objects
     url = _moonraker_build_url(base, poll_objects)
+    last_cfs_discovery = _now()
 
     native_spoolman_detected, native_spoolman_warning = await asyncio.to_thread(_moonraker_detect_native_spoolman, base)
 
@@ -1727,6 +1755,15 @@ async def moonraker_poll_loop() -> None:
 
     while True:
         try:
+            if not cfs_objects and (_now() - last_cfs_discovery) >= 30.0:
+                last_cfs_discovery = _now()
+                try:
+                    cfs_objects = await asyncio.to_thread(_moonraker_cfs_objects, base)
+                    poll_objects = base_objects + cfs_objects
+                    url = _moonraker_build_url(base, poll_objects)
+                except Exception:
+                    cfs_objects = []
+
             data = await asyncio.to_thread(_http_get_json, url)
             status = (((data or {}).get("result") or {}).get("status") or {})
             ps = status.get("print_stats") or {}
@@ -1809,7 +1846,7 @@ async def moonraker_poll_loop() -> None:
                             s.manufacturer = mfg
                         st.slots[sid] = s
             else:
-                st.cfs_connected = False
+                _clear_cfs_connection(st)
 
             # --- Per-slot history tracking (read-only) ---
             # Attribute delta filament_used(mm) to the currently active slot during a print.
@@ -1965,6 +2002,7 @@ async def moonraker_poll_loop() -> None:
                             float(end_ts),
                             ps_state,
                             str(getattr(st, "job_track_id", "") or ""),
+                            float(used_mm or 0.0),
                         )
                     except Exception as e:
                         _set_spoolman_status(st, last_error=f"Spoolman sync planning failed: {e}")
@@ -2017,6 +2055,7 @@ async def moonraker_poll_loop() -> None:
             st = load_state()
             st.printer_connected = False
             st.printer_last_error = str(e)
+            _clear_cfs_connection(st)
             st.updated_at = time.time()
             save_state(st)
 

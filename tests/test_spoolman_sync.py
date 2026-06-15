@@ -112,6 +112,22 @@ def test_current_job_id_is_best_effort_across_sources():
     assert appmod._moonraker_current_job_id({}, {}) == ""
 
 
+def test_clear_cfs_connection_removes_stale_printer_data(state):
+    state.cfs_connected = True
+    state.cfs_last_update = 123.0
+    state.cfs_active_slot = "1A"
+    state.cfs_slots = {"1A": {"material": "PLA"}}
+    state.cfs_raw = {"box": {"T1": {}}}
+
+    appmod._clear_cfs_connection(state)
+
+    assert state.cfs_connected is False
+    assert state.cfs_last_update == 123.0
+    assert state.cfs_active_slot is None
+    assert state.cfs_slots == {}
+    assert state.cfs_raw == {}
+
+
 def test_moonraker_build_url_encodes_object_names_with_spaces():
     url = appmod._moonraker_build_url(
         "http://printer.local:7125/",
@@ -347,6 +363,31 @@ def test_live_final_sync_posts_only_unsynced_remainder(monkeypatch, state):
     assert rec["sync_phase"] == "final"
     assert rec["used_mm"] == 50.0
     assert rec["status"] == "synced"
+
+
+def test_live_final_sync_caps_parser_total_to_printer_reported_total(monkeypatch, state):
+    calls = []
+    cfg = spoolman_config(enabled=True, dry_run=False, mappings={"1C": 1}, sync_mode="live")
+    state.job_track_slot_mm = {"1C": 9084.64}
+    state.job_track_slot_g = {"1C": 27.1}
+    state.job_track_spoolman_live_synced_mm = {"1C": 311.814}
+    monkeypatch.setattr(appmod, "load_config", lambda: {"spoolman": cfg})
+    monkeypatch.setattr(appmod, "_spoolman_get_spool", lambda spool_id, cfg=None: {"id": spool_id})
+    monkeypatch.setattr(appmod, "_spoolman_use_spool", lambda spool_id, used_mm, cfg=None: calls.append((spool_id, used_mm)) or {})
+
+    appmod._plan_spoolman_sync_for_finished_job(
+        state,
+        "10x5mm-magnet-dispenser-barrel_PLA_1h17m.gcode",
+        10,
+        20,
+        "complete",
+        printer_total_mm=7683.44,
+    )
+
+    assert calls == [(1, pytest.approx(7371.626, abs=0.001))]
+    rec = state.spoolman_sync_records["local:10x5mm-magnet-dispenser-barrel_PLA_1h17m.gcode:10:20:1C:final"]
+    assert rec["sync_phase"] == "final"
+    assert rec["used_mm"] == pytest.approx(7371.626, abs=0.001)
 
 
 def test_live_uncertain_record_blocks_final_reconciliation(monkeypatch, state):
