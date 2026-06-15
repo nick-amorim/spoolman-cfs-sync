@@ -35,11 +35,28 @@ UPDATE_CTID=""
 ADVANCED=0
 DEFAULT_MODE=0
 CUSTOM_OPTIONS=0
+LOG_FILE="${TMPDIR:-/tmp}/${APP_NAME}-lxc-install-$(date +%Y%m%d-%H%M%S).log"
 
 info() { echo -e "\033[1;34m[INFO]\033[0m $*"; }
 ok() { echo -e "\033[1;32m[OK]\033[0m $*"; }
 warn() { echo -e "\033[1;33m[WARN]\033[0m $*"; }
 die() { echo -e "\033[1;31m[ERROR]\033[0m $*" >&2; exit 1; }
+
+run_quiet() {
+  local label="$1"
+  shift
+  info "$label"
+  echo "## ${label}" >>"$LOG_FILE"
+  if "$@" >>"$LOG_FILE" 2>&1; then
+    ok "$label"
+    return 0
+  fi
+
+  echo -e "\033[1;31m[ERROR]\033[0m ${label} failed" >&2
+  echo "Last log lines from ${LOG_FILE}:" >&2
+  tail -n 40 "$LOG_FILE" >&2 || true
+  exit 1
+}
 
 usage() {
   cat <<EOF
@@ -190,7 +207,13 @@ next_ctid() {
 }
 
 latest_debian_template() {
-  pveam update >/dev/null
+  echo "## Refreshing Proxmox template metadata" >>"$LOG_FILE"
+  if ! pveam update >>"$LOG_FILE" 2>&1; then
+    echo -e "\033[1;31m[ERROR]\033[0m Refreshing Proxmox template metadata failed" >&2
+    echo "Last log lines from ${LOG_FILE}:" >&2
+    tail -n 40 "$LOG_FILE" >&2 || true
+    exit 1
+  fi
   pveam available --section system \
     | awk '/debian-12-standard/ {print $2}' \
     | sort -V \
@@ -200,8 +223,7 @@ latest_debian_template() {
 download_template_if_needed() {
   local template="$1"
   pveam list "$TEMPLATE_STORAGE" | awk '{print $1}' | grep -qx "${TEMPLATE_STORAGE}:vztmpl/${template}" && return 0
-  info "Downloading template ${template} to ${TEMPLATE_STORAGE}"
-  pveam download "$TEMPLATE_STORAGE" "$template"
+  run_quiet "Downloading Debian template ${template} to ${TEMPLATE_STORAGE}" pveam download "$TEMPLATE_STORAGE" "$template"
 }
 
 container_ip() {
@@ -242,8 +264,7 @@ create_container() {
   local password
   password="$(openssl rand -base64 24 | tr -d '\n')"
 
-  info "Creating CT ${CTID} (${HOSTNAME})"
-  pct create "$CTID" "${TEMPLATE_STORAGE}:vztmpl/${template}" \
+  run_quiet "Creating CT ${CTID} (${HOSTNAME})" pct create "$CTID" "${TEMPLATE_STORAGE}:vztmpl/${template}" \
     --hostname "$HOSTNAME" \
     --ostype debian \
     --unprivileged 1 \
@@ -258,8 +279,7 @@ create_container() {
     --tags "spoolman-cfs-sync;filament;3d-print" \
     --description "spoolman-cfs-sync"
 
-  info "Starting CT ${CTID}"
-  pct start "$CTID"
+  run_quiet "Starting CT ${CTID}" pct start "$CTID"
   wait_for_network
 }
 
@@ -269,11 +289,12 @@ install_app() {
   [[ -n "$MOONRAKER_URL" ]] && args+=(--moonraker-url "$MOONRAKER_URL")
   [[ -n "$SPOOLMAN_URL" ]] && args+=(--spoolman-url "$SPOOLMAN_URL")
 
-  info "Bootstrapping installer dependencies in CT ${CTID}"
-  pct exec "$CTID" -- bash -lc "export DEBIAN_FRONTEND=noninteractive; apt-get update >/dev/null && apt-get install -y --no-install-recommends ca-certificates curl >/dev/null"
+  run_quiet "Bootstrapping installer dependencies in CT ${CTID}" \
+    pct exec "$CTID" -- bash -lc "export DEBIAN_FRONTEND=noninteractive LC_ALL=C LANG=C; apt-get update -qq && apt-get install -y -qq --no-install-recommends ca-certificates curl"
 
-  info "Installing ${APP_NAME} in CT ${CTID}"
-  pct exec "$CTID" -- bash -lc "curl -fsSL '${raw_base}/install-app.sh' -o /tmp/spoolman-cfs-sync-install-app.sh"
+  run_quiet "Downloading app installer in CT ${CTID}" \
+    pct exec "$CTID" -- bash -lc "curl -fsSL '${raw_base}/install-app.sh' -o /tmp/spoolman-cfs-sync-install-app.sh"
+  info "Installing ${APP_NAME} inside CT ${CTID}"
   pct exec "$CTID" -- bash /tmp/spoolman-cfs-sync-install-app.sh "${args[@]}"
 }
 
@@ -298,6 +319,7 @@ main() {
   echo "Container: ${CTID}"
   echo "Service:   systemctl status spoolman-cfs-sync"
   echo "Update:    update"
+  echo "Install log: ${LOG_FILE}"
   if [[ -n "$ip" ]]; then
     echo "URL:       http://${ip}:${APP_PORT}"
   else
