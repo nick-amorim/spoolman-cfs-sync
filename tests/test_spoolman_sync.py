@@ -268,6 +268,7 @@ def test_clear_local_accounting_removes_test_data(monkeypatch, state):
     state.last_accounted_job_mm = 123
     state.last_accounted_slot = "1A"
     state.job_track_last_mm = 123
+    state.job_track_printer_used_mm = 123.0
     state.job_track_file_path = "old.gcode"
     state.job_track_last_file_position = 456
     state.job_track_file_size = 789
@@ -289,6 +290,7 @@ def test_clear_local_accounting_removes_test_data(monkeypatch, state):
     assert state.last_accounted_job_mm == 0
     assert state.last_accounted_slot is None
     assert state.job_track_last_mm == 0
+    assert state.job_track_printer_used_mm == 0.0
     assert state.job_track_file_path == ""
     assert state.job_track_last_file_position == 0
     assert state.job_track_file_size == 0
@@ -407,7 +409,8 @@ def test_live_sync_caps_parser_usage_to_printer_reported_total(monkeypatch, stat
         sync_mode="live",
         live_min_delta_mm=1.0,
     )
-    state.current_job_filament_mm = 200.0
+    state.current_job_filament_mm = 400.0
+    state.job_track_printer_used_mm = 200.0
     state.job_track_name = "part.gcode"
     state.job_track_id = "job-123"
     state.job_track_started_at = 10
