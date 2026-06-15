@@ -11,10 +11,27 @@ APP_PORT="8005"
 MOONRAKER_URL=""
 SPOOLMAN_URL=""
 SYNC_MODE="live"
+LOG_FILE="${TMPDIR:-/tmp}/${APP_NAME}-app-install-$(date +%Y%m%d-%H%M%S).log"
 
 info() { echo -e "\033[1;34m[INFO]\033[0m $*"; }
 ok() { echo -e "\033[1;32m[OK]\033[0m $*"; }
 die() { echo -e "\033[1;31m[ERROR]\033[0m $*" >&2; exit 1; }
+
+run_quiet() {
+  local label="$1"
+  shift
+  info "$label"
+  echo "## ${label}" >>"$LOG_FILE"
+  if "$@" >>"$LOG_FILE" 2>&1; then
+    ok "$label"
+    return 0
+  fi
+
+  echo -e "\033[1;31m[ERROR]\033[0m ${label} failed" >&2
+  echo "Last log lines from ${LOG_FILE}:" >&2
+  tail -n 40 "$LOG_FILE" >&2 || true
+  exit 1
+}
 
 usage() {
   cat <<EOF
@@ -57,10 +74,11 @@ need_root() {
 }
 
 install_packages() {
-  info "Installing system packages"
   export DEBIAN_FRONTEND=noninteractive
-  apt-get update
-  apt-get install -y --no-install-recommends \
+  export LC_ALL=C
+  export LANG=C
+  run_quiet "Updating package indexes" apt-get update -qq
+  run_quiet "Installing system packages" apt-get install -y -qq --no-install-recommends \
     ca-certificates \
     curl \
     git \
@@ -69,7 +87,6 @@ install_packages() {
     python3-venv \
     python3-dev \
     build-essential
-  ok "Installed system packages"
 }
 
 create_user() {
@@ -81,25 +98,21 @@ create_user() {
 
 clone_or_update_repo() {
   if [[ -d "${APP_DIR}/.git" ]]; then
-    info "Updating repository"
-    git -C "$APP_DIR" fetch --prune origin
-    git -C "$APP_DIR" checkout "$BRANCH"
-    git -C "$APP_DIR" reset --hard "origin/${BRANCH}"
+    run_quiet "Fetching repository updates" git -C "$APP_DIR" fetch --prune origin
+    run_quiet "Checking out ${BRANCH}" git -C "$APP_DIR" checkout "$BRANCH"
+    run_quiet "Resetting app to origin/${BRANCH}" git -C "$APP_DIR" reset --hard "origin/${BRANCH}"
   else
-    info "Cloning repository"
     rm -rf "$APP_DIR"
-    git clone --depth 1 --branch "$BRANCH" "$REPO_URL" "$APP_DIR"
+    run_quiet "Cloning repository" git clone --quiet --depth 1 --branch "$BRANCH" "$REPO_URL" "$APP_DIR"
   fi
   chown -R "$APP_USER:$APP_USER" "$APP_DIR"
 }
 
 install_python_deps() {
-  info "Installing Python dependencies"
-  python3 -m venv "${APP_DIR}/.venv"
-  "${APP_DIR}/.venv/bin/python" -m pip install --upgrade pip
-  "${APP_DIR}/.venv/bin/python" -m pip install -r "${APP_DIR}/requirements.txt"
+  run_quiet "Creating Python virtual environment" python3 -m venv "${APP_DIR}/.venv"
+  run_quiet "Upgrading pip" "${APP_DIR}/.venv/bin/python" -m pip install --quiet --upgrade pip
+  run_quiet "Installing Python dependencies" "${APP_DIR}/.venv/bin/python" -m pip install --quiet -r "${APP_DIR}/requirements.txt"
   chown -R "$APP_USER:$APP_USER" "${APP_DIR}/.venv"
-  ok "Installed Python dependencies"
 }
 
 write_initial_config() {
@@ -167,8 +180,8 @@ RestartSec=5
 [Install]
 WantedBy=multi-user.target
 EOF
-  systemctl daemon-reload
-  systemctl enable --now "$SERVICE_NAME"
+  run_quiet "Reloading systemd" systemctl daemon-reload
+  run_quiet "Enabling and starting service" systemctl enable --now "$SERVICE_NAME"
   ok "Created systemd service"
 }
 
@@ -189,6 +202,24 @@ write_update_helper() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+LOG_FILE="${TMPDIR:-/tmp}/spoolman-cfs-sync-update-$(date +%Y%m%d-%H%M%S).log"
+info() { echo -e "\033[1;34m[INFO]\033[0m $*"; }
+ok() { echo -e "\033[1;32m[OK]\033[0m $*"; }
+run_quiet() {
+  local label="$1"
+  shift
+  info "$label"
+  echo "## ${label}" >>"$LOG_FILE"
+  if "$@" >>"$LOG_FILE" 2>&1; then
+    ok "$label"
+    return 0
+  fi
+  echo -e "\033[1;31m[ERROR]\033[0m ${label} failed" >&2
+  echo "Last log lines from ${LOG_FILE}:" >&2
+  tail -n 40 "$LOG_FILE" >&2 || true
+  exit 1
+}
+
 if [[ "${EUID}" -ne 0 ]]; then
   echo "Run as root: sudo spoolman-cfs-sync-update" >&2
   exit 1
@@ -204,21 +235,21 @@ else
   BRANCH="main"
 fi
 
-echo "[INFO] Updating ${SERVICE_NAME} from origin/${BRANCH}"
+info "Updating ${SERVICE_NAME} from origin/${BRANCH}"
 cd "$APP_DIR"
-git fetch --prune origin
-git checkout "$BRANCH"
-git reset --hard "origin/${BRANCH}"
+run_quiet "Fetching repository updates" git fetch --prune origin
+run_quiet "Checking out ${BRANCH}" git checkout "$BRANCH"
+run_quiet "Resetting app to origin/${BRANCH}" git reset --hard "origin/${BRANCH}"
 
-python3 -m venv "${APP_DIR}/.venv"
-"${APP_DIR}/.venv/bin/python" -m pip install --upgrade pip
-"${APP_DIR}/.venv/bin/python" -m pip install -r "${APP_DIR}/requirements.txt"
+run_quiet "Creating Python virtual environment" python3 -m venv "${APP_DIR}/.venv"
+run_quiet "Upgrading pip" "${APP_DIR}/.venv/bin/python" -m pip install --quiet --upgrade pip
+run_quiet "Installing Python dependencies" "${APP_DIR}/.venv/bin/python" -m pip install --quiet -r "${APP_DIR}/requirements.txt"
 chown -R "${APP_USER}:${APP_USER}" "$APP_DIR"
 
-systemctl daemon-reload
-systemctl restart "$SERVICE_NAME"
-systemctl --no-pager --full status "$SERVICE_NAME" || true
-echo "[OK] Updated ${SERVICE_NAME}"
+run_quiet "Reloading systemd" systemctl daemon-reload
+run_quiet "Restarting ${SERVICE_NAME}" systemctl restart "$SERVICE_NAME"
+ok "Updated ${SERVICE_NAME}"
+echo "Update log: ${LOG_FILE}"
 EOF
   chmod +x "/usr/local/bin/${SERVICE_NAME}-update"
   cat >"/usr/local/bin/update" <<EOF
@@ -238,6 +269,7 @@ print_summary() {
   echo "Service status: systemctl status ${SERVICE_NAME}"
   echo "Logs:           journalctl -u ${SERVICE_NAME} -f"
   echo "Update:         update"
+  echo "Install log:    ${LOG_FILE}"
   if [[ -n "$ip" ]]; then
     echo "URL:            http://${ip}:${APP_PORT}"
   else

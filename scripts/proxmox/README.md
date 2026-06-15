@@ -107,6 +107,18 @@ The updater:
 
 Runtime files under `data/` are preserved.
 
+## Installer Output
+
+The installer keeps normal output concise:
+
+- each major step prints an `[INFO]` line
+- successful steps print an `[OK]` line
+- detailed command output is written to a `/tmp/spoolman-cfs-sync-*.log` file
+- if a step fails, the installer prints the last log lines automatically
+
+Downloading the Debian template and installing system packages can take a few
+minutes depending on the Proxmox host and network speed.
+
 ## Service Commands
 
 Inside the LXC:
