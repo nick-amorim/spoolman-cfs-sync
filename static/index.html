@@ -1,174 +1,283 @@
-﻿<!doctype html>
+<!doctype html>
 <html lang="en">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark light" />
     <title>spoolman-cfs-sync</title>
     <link rel="stylesheet" href="/static/style.css" />
   </head>
   <body>
-    <header class="topbar">
-      <div class="brand">
-        <div class="logo">FM</div>
-        <div>
-          <div class="title">spoolman-cfs-sync</div>
-          <div class="subtitle">CFS to Spoolman sync</div>
+    <!-- ===== Top app bar ===== -->
+    <header class="appbar" role="banner">
+      <div class="appbar-inner">
+        <div class="brand">
+          <div class="brand-mark" aria-hidden="true">S</div>
+          <div class="brand-text">
+            <div class="brand-title">spoolman-cfs-sync</div>
+            <div class="brand-sub">CFS &rarr; Spoolman</div>
+          </div>
+        </div>
+
+        <div class="conn-strip" role="status" aria-label="Connection status">
+          <div id="printerBadge" class="cstat" data-state="idle">
+            <span class="cdot"></span>
+            <span class="clabel">Printer</span>
+            <span class="cvalue">&mdash;</span>
+          </div>
+          <div id="cfsBadge" class="cstat" data-state="idle">
+            <span class="cdot"></span>
+            <span class="clabel">CFS</span>
+            <span class="cvalue">&mdash;</span>
+          </div>
+          <div id="spoolmanBadge" class="cstat" data-state="idle">
+            <span class="cdot"></span>
+            <span class="clabel">Spoolman</span>
+            <span class="cvalue">&mdash;</span>
+          </div>
+        </div>
+
+        <div class="appbar-actions">
+          <div class="refresh-ctl" title="Auto-refresh">
+            <select id="refreshSelect" class="ctl-select" aria-label="Refresh interval">
+              <option value="2000">2s</option>
+              <option value="5000">5s</option>
+              <option value="10000">10s</option>
+              <option value="15000">15s</option>
+              <option value="30000">30s</option>
+            </select>
+            <button id="refreshToggle" class="icon-btn" type="button" title="Pause auto-refresh" aria-label="Pause auto-refresh">
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="5" width="4" height="14"></rect><rect x="14" y="5" width="4" height="14"></rect></svg>
+            </button>
+          </div>
+          <button id="themeToggle" class="icon-btn" type="button" title="Toggle theme" aria-label="Toggle theme">
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+          </button>
+          <button id="settingsOpen" class="icon-btn primary" type="button" title="Settings" aria-label="Open settings">
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+            <span class="icon-btn-label">Settings</span>
+          </button>
         </div>
       </div>
 
-      <div class="badges">
-        <div id="printerBadge" class="badge">Printer: -</div>
-        <div id="cfsBadge" class="badge">CFS: -</div>
-        <button id="settingsOpen" class="settingsBtn" type="button">Settings</button>
-      </div>
+      <!-- Global warning bar (only shown when needed) -->
+      <div id="warnBar" class="warn-bar" hidden></div>
     </header>
 
-    <main class="container">
-      <div class="layout">
-        <div class="leftCol">
-          <section class="grid" id="boxesGrid"></section>
-
-          <section class="card" style="margin-top: 16px;">
-            <div class="cardHead">
-              <div class="cardTitle">Active Slot</div>
-              <div id="activeMeta" class="cardMeta">-</div>
-            </div>
-            <div class="activeRow" id="activeRow"></div>
-            <div id="activeLive" class="activeLive" style="display:none;"></div>
-          </section>
-
-          <section class="card" id="spoolmanCard" style="margin-top: 16px;">
-            <div class="cardHead">
-              <div class="cardTitle">Spoolman Sync</div>
-              <div id="spoolmanMeta" class="cardMeta">-</div>
-            </div>
-            <div class="spoolmanPanel" id="spoolmanPanel"></div>
-          </section>
+    <!-- ===== Main dashboard ===== -->
+    <main class="dash">
+      <!-- Active job + live sync -->
+      <section class="panel panel-job" aria-labelledby="jobTitle">
+        <header class="panel-head">
+          <h2 id="jobTitle" class="panel-title">Active Print</h2>
+          <div id="jobMeta" class="panel-meta">Idle</div>
+        </header>
+        <div id="jobBody" class="panel-body job-body">
+          <div class="job-empty">No active print &middot; no CFS slot selected.</div>
         </div>
+      </section>
 
-        <aside class="rightCol">
-          <section class="card" id="historyCard">
-            <div class="cardHead">
-              <div class="cardTitle">History by Slot</div>
-              <div class="cardMeta">
-                <span class="tag muted">latest 4</span>
-                <button id="clearAccountingBtn" class="btn mini danger" type="button">Clear Test Data</button>
-                <div class="refreshCtl">
-                  <label class="refreshLbl" for="refreshSelect">Refresh</label>
-                  <select id="refreshSelect" class="refreshSel" title="Refresh interval">
-                    <option value="2000">2s</option>
-                    <option value="5000">5s</option>
-                    <option value="10000">10s</option>
-                    <option value="15000">15s</option>
-                    <option value="30000">30s</option>
-                  </select>
-                  <button id="refreshToggle" class="refreshBtn" title="Toggle auto-refresh">Pause</button>
-                </div>
-              </div>
+      <!-- CFS boxes grid -->
+      <section class="panel panel-cfs" aria-labelledby="cfsTitle">
+        <header class="panel-head">
+          <h2 id="cfsTitle" class="panel-title">CFS Slots</h2>
+          <div id="cfsMeta" class="panel-meta">&mdash;</div>
+        </header>
+        <div id="cfsGrid" class="cfs-grid"></div>
+      </section>
+
+      <div class="two-col">
+        <!-- Spoolman sync records -->
+        <section class="panel" aria-labelledby="syncTitle">
+          <header class="panel-head">
+            <h2 id="syncTitle" class="panel-title">Sync Records</h2>
+            <div id="syncMeta" class="panel-meta">&mdash;</div>
+          </header>
+          <div id="syncList" class="sync-list"></div>
+        </section>
+
+        <!-- Per-slot history -->
+        <section class="panel" aria-labelledby="histTitle">
+          <header class="panel-head">
+            <h2 id="histTitle" class="panel-title">Slot History</h2>
+            <div class="panel-meta">
+              <span class="chip chip-muted">latest 4 · expand for more</span>
+              <button id="clearAccountingBtn" class="btn btn-danger btn-mini" type="button" hidden>Clear data</button>
             </div>
-            <div class="history" id="slotHistory"></div>
+          </header>
+          <div id="slotHistory" class="hist-list"></div>
 
-            <details class="details" style="margin-top:12px;">
-              <summary>Moonraker History (all jobs)</summary>
-              <div class="moonHist" id="moonHistory"></div>
-            </details>
-          </section>
-        </aside>
+          <details class="moon-details">
+            <summary>Moonraker history (all jobs)</summary>
+            <div id="moonHistory" class="moon-list"></div>
+          </details>
+        </section>
       </div>
 
-      <footer class="footer">
-        <span>Tip: If colors or materials are not shown, check <code>moonraker_url</code> in <code>data/config.json</code>.</span>
+      <footer class="dash-footer">
+        <span>If colors or materials don't appear, check <code>moonraker_url</code> in Settings.</span>
       </footer>
     </main>
 
-    <!-- cache-bust: force clients to fetch latest app.js after updates -->
-    <script src="/static/app.js?v=20260225-7"></script>
-
-    <!-- Slot / Spool editor (local bookkeeping only; never talks to printer) -->
-    <div id="spoolModal" class="modal" style="display:none;">
-      <div class="modalBackdrop" id="spoolBackdrop"></div>
-      <div class="modalPanel">
-        <div class="modalHead">
+    <!-- ===== Slot bookkeeping modal (local weight reference) ===== -->
+    <div id="spoolModal" class="modal" hidden role="dialog" aria-modal="true" aria-labelledby="spoolTitle">
+      <div class="modal-backdrop" data-close="spool"></div>
+      <div class="modal-panel">
+        <header class="modal-head">
           <div>
-            <div class="modalTitle" id="spoolTitle">Slot</div>
-            <div class="modalSub" id="spoolSub">-</div>
+            <h3 class="modal-title" id="spoolTitle">Slot</h3>
+            <div class="modal-sub" id="spoolSub">&mdash;</div>
           </div>
-          <button class="modalClose" id="spoolClose" title="Close">x</button>
-        </div>
-        <div class="modalBody">
-          <div class="formRow">
-            <label>Current weight (g)</label>
-            <input id="spoolRemain" type="number" min="0" step="1" placeholder="e.g. 206" />
-            <button id="spoolSaveRemain" class="btn">Apply</button>
+          <button id="spoolClose" class="modal-close" data-close="spool" aria-label="Close">&times;</button>
+        </header>
+        <div class="modal-body">
+          <div class="form-row">
+            <label for="spoolRemain">Current weight (g)</label>
+            <div class="form-inline">
+              <input id="spoolRemain" type="number" min="0" step="1" placeholder="e.g. 206" />
+              <button id="spoolSaveRemain" class="btn">Apply</button>
+            </div>
           </div>
-          <div class="formRow">
-            <label>New spool (g)</label>
-            <input id="spoolStart" type="number" min="1" step="1" placeholder="e.g. 1000" />
-            <button id="spoolSaveStart" class="btn">Change Spool</button>
+          <div class="form-row">
+            <label for="spoolStart">New spool (g)</label>
+            <div class="form-inline">
+              <input id="spoolStart" type="number" min="1" step="1" placeholder="e.g. 1000" />
+              <button id="spoolSaveStart" class="btn btn-secondary">Change spool</button>
+            </div>
           </div>
-          <div class="modalStats" id="spoolStats">-</div>
-          <div class="modalHint">Note: This is saved locally in this app only. It does not send anything to the printer. Changing the spool hides older prints from the slot history, while keeping them stored internally.</div>
+          <div class="modal-stats" id="spoolStats">&mdash;</div>
+          <p class="modal-hint">Local bookkeeping only. Nothing is sent to the printer or to Spoolman. Changing the spool hides older prints from this slot's history but keeps them on disk.</p>
         </div>
       </div>
     </div>
 
-    <div id="spoolmanPickerModal" class="modal" style="display:none;">
-      <div class="modalBackdrop" id="spoolmanPickerBackdrop"></div>
-      <div class="modalPanel spoolmanPickerPanel">
-        <div class="modalHead">
+    <!-- ===== Spoolman spool picker modal ===== -->
+    <div id="spoolmanPickerModal" class="modal" hidden role="dialog" aria-modal="true" aria-labelledby="spoolmanPickerTitle">
+      <div class="modal-backdrop" data-close="picker"></div>
+      <div class="modal-panel modal-panel-wide">
+        <header class="modal-head">
           <div>
-            <div class="modalTitle" id="spoolmanPickerTitle">Select Spool</div>
-            <div class="modalSub" id="spoolmanPickerSub">-</div>
+            <h3 class="modal-title" id="spoolmanPickerTitle">Select Spoolman spool</h3>
+            <div class="modal-sub" id="spoolmanPickerSub">&mdash;</div>
           </div>
-          <button class="modalClose" id="spoolmanPickerClose" title="Close">x</button>
-        </div>
-        <div class="modalBody">
-          <input id="spoolmanPickerSearch" class="spoolmanPickerSearch" type="search" placeholder="Search filament, material, vendor, or spool id" />
-          <div id="spoolmanPickerStatus" class="spoolmanPickerStatus"></div>
-          <div id="spoolmanPickerList" class="spoolmanPickerList"></div>
+          <button class="modal-close" data-close="picker" aria-label="Close">&times;</button>
+        </header>
+        <div class="modal-body">
+          <input id="spoolmanPickerSearch" class="search-input" type="search"
+                 placeholder="Search filament, material, vendor, or spool ID" autocomplete="off" />
+          <div id="spoolmanPickerStatus" class="picker-status">&mdash;</div>
+          <div id="spoolmanPickerList" class="picker-list" role="listbox"></div>
         </div>
       </div>
     </div>
 
-    <div id="settingsModal" class="modal" style="display:none;">
-      <div class="modalBackdrop" id="settingsBackdrop"></div>
-      <div class="modalPanel">
-        <div class="modalHead">
+    <!-- ===== Settings drawer ===== -->
+    <div id="settingsModal" class="drawer" hidden role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
+      <div class="modal-backdrop" data-close="settings"></div>
+      <aside class="drawer-panel">
+        <header class="modal-head">
           <div>
-            <div class="modalTitle">Printer / CFS Settings</div>
-            <div class="modalSub">Moonraker connection and local tracking options</div>
+            <h3 class="modal-title" id="settingsTitle">Settings</h3>
+            <div class="modal-sub">Printer, Spoolman, sync behavior &amp; debug</div>
           </div>
-          <button class="modalClose" id="settingsClose" title="Close">x</button>
+          <button class="modal-close" data-close="settings" aria-label="Close">&times;</button>
+        </header>
+        <div class="drawer-body">
+
+          <!-- Printer / Moonraker -->
+          <section class="settings-group">
+            <h4 class="settings-group-title">Printer / Moonraker</h4>
+            <div class="form-row">
+              <label for="settingsMoonrakerUrl">Moonraker URL</label>
+              <input id="settingsMoonrakerUrl" type="url" placeholder="http://printer-ip:7125" />
+            </div>
+            <div class="form-row form-row-grid-2">
+              <div>
+                <label for="settingsPollInterval">Poll interval (s)</label>
+                <input id="settingsPollInterval" type="number" min="1" max="60" step="1" />
+              </div>
+              <div>
+                <label for="settingsFilamentDiameter">Filament &oslash; (mm)</label>
+                <input id="settingsFilamentDiameter" type="number" min="0.5" max="5" step="0.01" />
+              </div>
+            </div>
+            <label class="toggle-row">
+              <input id="settingsCfsAutosync" type="checkbox" />
+              <span>
+                <strong>Import CFS material, color &amp; name into local slots</strong>
+                <em>Overwrites local slot metadata when the CFS reports new values.</em>
+              </span>
+            </label>
+          </section>
+
+          <!-- Spoolman -->
+          <section class="settings-group">
+            <h4 class="settings-group-title">Spoolman</h4>
+            <div class="form-row">
+              <label for="settingsSpoolmanUrl">Spoolman URL</label>
+              <input id="settingsSpoolmanUrl" type="url" placeholder="http://spoolman-host:7912" />
+            </div>
+            <div class="form-actions">
+              <button id="settingsSpoolmanTest" class="btn btn-secondary btn-mini" type="button">Test connection</button>
+              <span id="settingsSpoolmanTestStatus" class="form-actions-meta">&mdash;</span>
+            </div>
+          </section>
+
+          <!-- Sync behavior -->
+          <section class="settings-group">
+            <h4 class="settings-group-title">Sync behavior</h4>
+
+            <label class="toggle-row toggle-row-danger">
+              <input id="settingsSpoolmanEnabled" type="checkbox" />
+              <span>
+                <strong>Enable Spoolman writes</strong>
+                <em>Off by default. When off, the app never decrements Spoolman inventory.</em>
+              </span>
+            </label>
+
+            <div class="form-row form-row-grid-2">
+              <div>
+                <label for="settingsSpoolmanMode">Sync mode</label>
+                <select id="settingsSpoolmanMode">
+                  <option value="post_print">Post-print</option>
+                  <option value="live">Live (during print)</option>
+                </select>
+              </div>
+              <div>
+                <label for="settingsSpoolmanLiveDelta">Live threshold (mm)</label>
+                <input id="settingsSpoolmanLiveDelta" type="number" min="1" max="5000" step="1" />
+              </div>
+            </div>
+
+            <label class="toggle-row" id="settingsDryRunRow" hidden>
+              <input id="settingsSpoolmanDryRun" type="checkbox" />
+              <span>
+                <strong>Dry run</strong>
+                <em>Compute and log syncs, but never POST to Spoolman.</em>
+              </span>
+            </label>
+          </section>
+
+          <!-- Debug -->
+          <section class="settings-group">
+            <h4 class="settings-group-title">Debug</h4>
+            <label class="toggle-row">
+              <input id="settingsDebugMode" type="checkbox" />
+              <span>
+                <strong>Enable debug mode</strong>
+                <em>Reveals dry-run toggle and the "Clear data" action.</em>
+              </span>
+            </label>
+          </section>
+
+          <div class="drawer-footer">
+            <div id="settingsStatus" class="form-status" role="status">&nbsp;</div>
+            <button id="settingsSave" class="btn" type="button">Save settings</button>
+          </div>
         </div>
-        <div class="modalBody">
-          <div class="formRow">
-            <label>Moonraker URL</label>
-            <input id="settingsMoonrakerUrl" type="url" placeholder="http://printer-ip:7125" />
-            <button id="settingsSave" class="btn">Save</button>
-          </div>
-          <div class="formRow">
-            <label>Poll interval (s)</label>
-            <input id="settingsPollInterval" type="number" min="1" max="60" step="1" />
-            <span></span>
-          </div>
-          <div class="formRow">
-            <label>Filament diameter (mm)</label>
-            <input id="settingsFilamentDiameter" type="number" min="0.5" max="5" step="0.01" />
-            <span></span>
-          </div>
-          <label class="settingsCheck">
-            <input id="settingsCfsAutosync" type="checkbox" />
-            Import CFS material, color, and name into local slots
-          </label>
-          <label class="settingsCheck">
-            <input id="settingsDebugMode" type="checkbox" />
-            Enable debug mode
-          </label>
-          <div id="settingsStatus" class="modalHint"></div>
-        </div>
-      </div>
+      </aside>
     </div>
+
+    <script src="/static/app.js?v=redesign-2"></script>
   </body>
 </html>
-
-
