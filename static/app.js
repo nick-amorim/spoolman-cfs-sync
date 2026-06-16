@@ -782,11 +782,11 @@ function renderWarnings(state) {
   const bar = $("warnBar");
   if (!bar) return;
   const status = state.spoolman_status || {};
-  if (status.moonraker_native_detected) {
+  const warning = String(status.moonraker_native_warning || "").trim();
+  if (warning) {
     bar.hidden = false;
     bar.classList.add("danger");
-    bar.textContent = status.moonraker_native_warning ||
-      "⚠ Moonraker's native Spoolman integration appears to be enabled. Disable it to avoid double-accounting.";
+    bar.textContent = warning;
   } else {
     bar.hidden = true;
     bar.classList.remove("danger");
