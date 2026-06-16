@@ -260,6 +260,14 @@ set -Eeuo pipefail
 exec /usr/local/bin/${SERVICE_NAME}-update "\$@"
 EOF
   chmod +x "/usr/local/bin/update"
+  if ! command -v update >/dev/null 2>&1; then
+    cat >"/usr/bin/update" <<EOF
+#!/usr/bin/env bash
+set -Eeuo pipefail
+exec /usr/local/bin/${SERVICE_NAME}-update "\$@"
+EOF
+    chmod +x "/usr/bin/update"
+  fi
   ok "Installed update helper"
 }
 
