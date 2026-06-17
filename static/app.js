@@ -240,9 +240,13 @@ function buildSlotCard(state, slots, sid, isActive) {
   const mappings = cfg.slot_mappings || {};
   const mapped = mappings[sid];
   const spool = findSpool(mapped);
+  const displayColor = spool ? spoolColor(spool, meta.color) : meta.color;
+  const displayMaterial = spool ? spoolMaterial(spool) : meta.material;
+  const displayVendor = spool ? spoolVendor(spool) : meta.vendor;
+  const displayName = spool ? spoolFilamentName(spool) : meta.name;
 
   const swatch = el("div", { class: "slot-swatch" + (meta.present === false ? " absent" : "") });
-  if (meta.present !== false) swatch.style.background = meta.color;
+  if (meta.present !== false || spool) swatch.style.background = displayColor;
 
   const main = el("div", { class: "slot-main" });
   const idRow = el("div", { class: "slot-id-row" }, [
@@ -251,18 +255,18 @@ function buildSlotCard(state, slots, sid, isActive) {
   ]);
   main.appendChild(idRow);
 
-  if (meta.name) {
-    main.appendChild(el("div", { class: "slot-name", text: meta.name }));
+  if (displayName) {
+    main.appendChild(el("div", { class: "slot-name", text: displayName }));
   } else if (meta.present === false) {
     main.appendChild(el("div", { class: "slot-name", text: "Empty slot" }));
   } else {
-    main.appendChild(el("div", { class: "slot-name", text: meta.material || "Unnamed filament" }));
+    main.appendChild(el("div", { class: "slot-name", text: displayMaterial || "Unnamed filament" }));
   }
 
   const subBits = [];
-  if (meta.material) subBits.push(meta.material);
-  if (meta.vendor)   subBits.push(meta.vendor);
-  if (meta.color && meta.present !== false) subBits.push(meta.color);
+  if (displayMaterial && displayMaterial !== "—") subBits.push(displayMaterial);
+  if (displayVendor) subBits.push(displayVendor);
+  if (displayColor && (meta.present !== false || spool)) subBits.push(displayColor);
   if (subBits.length) main.appendChild(el("div", { class: "slot-sub", text: subBits.join(" · ") }));
 
   const mapping = el("div", { class: "slot-mapping" });
