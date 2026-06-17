@@ -3,8 +3,12 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import os
 import re
 import socket
+import subprocess
+import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -73,6 +77,7 @@ STATE_PATH = DATA_DIR / "state.json"
 PROFILES_PATH = DATA_DIR / "profiles.json"
 CONFIG_PATH = DATA_DIR / "config.json"
 MOONRAKER_POLL_TASK: Optional[asyncio.Task] = None
+APP_UPDATE_LOCK = threading.Lock()
 
 DEFAULT_SLOTS = [
     "1A", "1B", "1C", "1D",
@@ -1380,6 +1385,133 @@ def _update_spoolman_mapping(slot_id: str, spool_id: Optional[int]) -> dict:
     return _normalize_spoolman_config(cfg)
 
 
+def _short_commit(value: str) -> str:
+    return str(value or "").strip()[:8]
+
+
+def _run_app_update_cmd(args: list[str], *, timeout: float = 30.0, check: bool = True) -> subprocess.CompletedProcess:
+    proc = subprocess.run(
+        args,
+        cwd=str(APP_DIR),
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    if check and proc.returncode != 0:
+        output = "\n".join(part.strip() for part in (proc.stdout, proc.stderr) if part and part.strip())
+        raise RuntimeError(output or f"{' '.join(args)} failed with exit code {proc.returncode}")
+    return proc
+
+
+def _app_update_stdout(args: list[str], *, timeout: float = 30.0) -> str:
+    proc = _run_app_update_cmd(args, timeout=timeout, check=True)
+    return str(proc.stdout or "").strip()
+
+
+def _app_update_success(args: list[str], *, timeout: float = 30.0) -> bool:
+    proc = _run_app_update_cmd(args, timeout=timeout, check=False)
+    return proc.returncode == 0
+
+
+def _trust_app_update_dir() -> None:
+    _app_update_stdout(["git", "config", "--global", "--add", "safe.directory", str(APP_DIR)], timeout=10)
+
+
+def _app_update_check(fetch: bool = True) -> dict:
+    if not (APP_DIR / ".git").exists():
+        return {
+            "supported": False,
+            "update_available": False,
+            "can_update": False,
+            "message": "This install is not a Git checkout.",
+        }
+
+    _trust_app_update_dir()
+    _app_update_stdout(["git", "rev-parse", "--is-inside-work-tree"], timeout=10)
+    if fetch:
+        _app_update_stdout(["git", "fetch", "--quiet", "origin", "main"], timeout=90)
+
+    current = _app_update_stdout(["git", "rev-parse", "HEAD"], timeout=10)
+    remote = _app_update_stdout(["git", "rev-parse", "origin/main"], timeout=10)
+    branch = _app_update_stdout(["git", "rev-parse", "--abbrev-ref", "HEAD"], timeout=10)
+    dirty = bool(_app_update_stdout(["git", "status", "--porcelain"], timeout=10))
+    update_available = bool(current and remote and current != remote)
+    current_is_ancestor = _app_update_success(["git", "merge-base", "--is-ancestor", current, remote], timeout=10)
+
+    can_update = bool(update_available and current_is_ancestor and not dirty)
+    if not update_available:
+        message = "Already up to date."
+    elif dirty:
+        message = "Update available, but tracked local changes are present."
+    elif not current_is_ancestor:
+        message = "Update available, but the local checkout has diverged from origin/main."
+    else:
+        message = "Update available."
+
+    return {
+        "supported": True,
+        "branch": branch,
+        "current_commit": current,
+        "current_short": _short_commit(current),
+        "remote_commit": remote,
+        "remote_short": _short_commit(remote),
+        "update_available": update_available,
+        "can_update": can_update,
+        "dirty": dirty,
+        "diverged": bool(update_available and not current_is_ancestor),
+        "checked_at": _now(),
+        "message": message,
+    }
+
+
+def _schedule_app_restart(delay_sec: float = 2.0) -> None:
+    def restart() -> None:
+        os._exit(0)
+
+    t = threading.Timer(float(delay_sec), restart)
+    t.daemon = True
+    t.start()
+
+
+def _apply_app_update(*, schedule_restart: bool = True) -> dict:
+    if not APP_UPDATE_LOCK.acquire(blocking=False):
+        return {
+            "started": False,
+            "restart_scheduled": False,
+            "message": "An update is already running.",
+        }
+    try:
+        before = _app_update_check(fetch=True)
+        if not before.get("can_update"):
+            before.update({"started": False, "restart_scheduled": False})
+            return before
+
+        _app_update_stdout(["git", "checkout", "-q", "main"], timeout=30)
+        _app_update_stdout(["git", "reset", "--hard", "origin/main"], timeout=60)
+
+        python_exe = sys.executable or str(APP_DIR / ".venv" / "bin" / "python")
+        _app_update_stdout(
+            [python_exe, "-m", "pip", "install", "--quiet", "-r", str(APP_DIR / "requirements.txt")],
+            timeout=180,
+        )
+
+        after = _app_update_check(fetch=False)
+        after.update(
+            {
+                "started": True,
+                "restart_scheduled": bool(schedule_restart),
+                "previous_commit": before.get("current_commit"),
+                "previous_short": before.get("current_short"),
+                "message": "Update installed. Restarting the app service.",
+            }
+        )
+        if schedule_restart:
+            _schedule_app_restart()
+        return after
+    finally:
+        APP_UPDATE_LOCK.release()
+
+
 def _moonraker_fetch_history(base: str, limit: int = 20) -> list[dict]:
     """Fetch Moonraker job history list (best effort).
 
@@ -2342,6 +2474,30 @@ def _clear_local_accounting(state: AppState) -> AppState:
 
 
 # --- UI API (static frontend uses /api/ui/* and expects {"result": ...}) ---
+@app.post("/api/ui/update/check", response_model=ApiResponse)
+def api_ui_update_check() -> ApiResponse:
+    try:
+        return ApiResponse(result=_app_update_check(fetch=True))
+    except Exception as e:
+        return ApiResponse(
+            result={
+                "supported": False,
+                "update_available": False,
+                "can_update": False,
+                "message": f"Could not check for updates: {e}",
+                "checked_at": _now(),
+            }
+        )
+
+
+@app.post("/api/ui/update/apply", response_model=ApiResponse)
+def api_ui_update_apply() -> ApiResponse:
+    try:
+        return ApiResponse(result=_apply_app_update(schedule_restart=True))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not apply update: {e}") from e
+
+
 @app.get("/api/ui/state", response_model=ApiResponse)
 def api_ui_state() -> ApiResponse:
     return ApiResponse(result=_ui_state_dict(load_state()))

@@ -466,6 +466,56 @@ function applyDebugVisibility() {
   $("settingsDryRunRow").hidden = !on;
 }
 
+function renderUpdateStatus(info) {
+  const status = $("settingsUpdateStatus");
+  const apply = $("settingsUpdateApply");
+  if (!status || !apply) return;
+
+  const current = info?.current_short ? `Current ${info.current_short}` : "";
+  const remote = info?.remote_short ? `Latest ${info.remote_short}` : "";
+  const refs = [current, remote].filter(Boolean).join(" · ");
+  const message = info?.message || "Unable to read update status.";
+  status.textContent = refs ? `${message} ${refs}` : message;
+  apply.hidden = !(info?.update_available && info?.can_update);
+  apply.disabled = apply.hidden;
+}
+
+async function checkAppUpdate() {
+  const status = $("settingsUpdateStatus");
+  const apply = $("settingsUpdateApply");
+  if (status) status.textContent = "Checking for updates...";
+  if (apply) {
+    apply.hidden = true;
+    apply.disabled = true;
+  }
+  try {
+    const j = await postJson("/api/ui/update/check", {});
+    renderUpdateStatus(j.result || j);
+  } catch (err) {
+    if (status) status.textContent = "Could not check for updates: " + (err?.message || String(err));
+  }
+}
+
+async function applyAppUpdate() {
+  const status = $("settingsUpdateStatus");
+  const apply = $("settingsUpdateApply");
+  if (!confirm("Install the latest version and restart spoolman-cfs-sync?")) return;
+  if (status) status.textContent = "Installing update...";
+  if (apply) apply.disabled = true;
+  try {
+    const j = await postJson("/api/ui/update/apply", {});
+    const info = j.result || j;
+    renderUpdateStatus(info);
+    if (info.started) {
+      if (status) status.textContent = "Update installed. Restarting service...";
+      setTimeout(() => window.location.reload(), 6000);
+    }
+  } catch (err) {
+    if (status) status.textContent = "Could not install update: " + (err?.message || String(err));
+    if (apply) apply.disabled = false;
+  }
+}
+
 function initSettings() {
   $("settingsOpen").onclick   = openSettingsModal;
   $("settingsDebugMode").addEventListener("change", applyDebugVisibility);
@@ -514,6 +564,9 @@ function initSettings() {
       status.textContent = "Could not save: " + (err?.message || String(err));
     }
   };
+
+  $("settingsUpdateCheck").onclick = checkAppUpdate;
+  $("settingsUpdateApply").onclick = applyAppUpdate;
 }
 
 /* ---------- generic modal close wiring ---------- */
