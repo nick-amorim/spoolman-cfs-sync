@@ -201,15 +201,21 @@ bash <(curl -fsSL https://raw.githubusercontent.com/nick-amorim/spoolman-cfs-syn
   --spoolman-url http://SPOOLMAN_IP:7912
 ```
 
-The installer creates a Debian LXC, installs the app as a systemd service, and
-adds an update helper inside the container:
+The installer creates a Debian LXC and installs the app as a systemd service.
+For normal updates, open the web UI, go to **Settings**, click **Check for
+updates**, then click **Install update** when a new version is available. The
+app updates its Git checkout, refreshes Python dependencies, and restarts the
+service automatically.
+
+The installer also adds update helpers inside the container:
 
 ```bash
 update
 ```
 
 `spoolman-cfs-sync-update` is also available as the explicit app-specific
-updater.
+updater. If the short `update` command is not available in the container shell,
+use the Settings update flow or run `/usr/local/bin/spoolman-cfs-sync-update`.
 
 From the Proxmox host, update an existing container with:
 

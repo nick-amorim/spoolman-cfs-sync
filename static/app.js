@@ -240,9 +240,13 @@ function buildSlotCard(state, slots, sid, isActive) {
   const mappings = cfg.slot_mappings || {};
   const mapped = mappings[sid];
   const spool = findSpool(mapped);
+  const displayColor = spool ? spoolColor(spool, meta.color) : meta.color;
+  const displayMaterial = spool ? spoolMaterial(spool) : meta.material;
+  const displayVendor = spool ? spoolVendor(spool) : meta.vendor;
+  const displayName = spool ? spoolFilamentName(spool) : meta.name;
 
   const swatch = el("div", { class: "slot-swatch" + (meta.present === false ? " absent" : "") });
-  if (meta.present !== false) swatch.style.background = meta.color;
+  if (meta.present !== false || spool) swatch.style.background = displayColor;
 
   const main = el("div", { class: "slot-main" });
   const idRow = el("div", { class: "slot-id-row" }, [
@@ -251,18 +255,18 @@ function buildSlotCard(state, slots, sid, isActive) {
   ]);
   main.appendChild(idRow);
 
-  if (meta.name) {
-    main.appendChild(el("div", { class: "slot-name", text: meta.name }));
+  if (displayName) {
+    main.appendChild(el("div", { class: "slot-name", text: displayName }));
   } else if (meta.present === false) {
     main.appendChild(el("div", { class: "slot-name", text: "Empty slot" }));
   } else {
-    main.appendChild(el("div", { class: "slot-name", text: meta.material || "Unnamed filament" }));
+    main.appendChild(el("div", { class: "slot-name", text: displayMaterial || "Unnamed filament" }));
   }
 
   const subBits = [];
-  if (meta.material) subBits.push(meta.material);
-  if (meta.vendor)   subBits.push(meta.vendor);
-  if (meta.color && meta.present !== false) subBits.push(meta.color);
+  if (displayMaterial && displayMaterial !== "—") subBits.push(displayMaterial);
+  if (displayVendor) subBits.push(displayVendor);
+  if (displayColor && (meta.present !== false || spool)) subBits.push(displayColor);
   if (subBits.length) main.appendChild(el("div", { class: "slot-sub", text: subBits.join(" · ") }));
 
   const mapping = el("div", { class: "slot-mapping" });
@@ -462,6 +466,56 @@ function applyDebugVisibility() {
   $("settingsDryRunRow").hidden = !on;
 }
 
+function renderUpdateStatus(info) {
+  const status = $("settingsUpdateStatus");
+  const apply = $("settingsUpdateApply");
+  if (!status || !apply) return;
+
+  const current = info?.current_short ? `Current ${info.current_short}` : "";
+  const remote = info?.remote_short ? `Latest ${info.remote_short}` : "";
+  const refs = [current, remote].filter(Boolean).join(" · ");
+  const message = info?.message || "Unable to read update status.";
+  status.textContent = refs ? `${message} ${refs}` : message;
+  apply.hidden = !(info?.update_available && info?.can_update);
+  apply.disabled = apply.hidden;
+}
+
+async function checkAppUpdate() {
+  const status = $("settingsUpdateStatus");
+  const apply = $("settingsUpdateApply");
+  if (status) status.textContent = "Checking for updates...";
+  if (apply) {
+    apply.hidden = true;
+    apply.disabled = true;
+  }
+  try {
+    const j = await postJson("/api/ui/update/check", {});
+    renderUpdateStatus(j.result || j);
+  } catch (err) {
+    if (status) status.textContent = "Could not check for updates: " + (err?.message || String(err));
+  }
+}
+
+async function applyAppUpdate() {
+  const status = $("settingsUpdateStatus");
+  const apply = $("settingsUpdateApply");
+  if (!confirm("Install the latest version and restart spoolman-cfs-sync?")) return;
+  if (status) status.textContent = "Installing update...";
+  if (apply) apply.disabled = true;
+  try {
+    const j = await postJson("/api/ui/update/apply", {});
+    const info = j.result || j;
+    renderUpdateStatus(info);
+    if (info.started) {
+      if (status) status.textContent = "Update installed. Restarting service...";
+      setTimeout(() => window.location.reload(), 6000);
+    }
+  } catch (err) {
+    if (status) status.textContent = "Could not install update: " + (err?.message || String(err));
+    if (apply) apply.disabled = false;
+  }
+}
+
 function initSettings() {
   $("settingsOpen").onclick   = openSettingsModal;
   $("settingsDebugMode").addEventListener("change", applyDebugVisibility);
@@ -510,6 +564,9 @@ function initSettings() {
       status.textContent = "Could not save: " + (err?.message || String(err));
     }
   };
+
+  $("settingsUpdateCheck").onclick = checkAppUpdate;
+  $("settingsUpdateApply").onclick = applyAppUpdate;
 }
 
 /* ---------- generic modal close wiring ---------- */

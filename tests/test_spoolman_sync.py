@@ -189,6 +189,123 @@ def test_moonraker_native_spoolman_not_installed_has_no_warning(monkeypatch):
     assert warning == ""
 
 
+def test_app_update_check_reports_available_clean_checkout(monkeypatch, tmp_path):
+    (tmp_path / ".git").mkdir()
+    monkeypatch.setattr(appmod, "APP_DIR", tmp_path)
+
+    def fake_run(args, *, timeout=30.0, check=True):
+        cmd = tuple(args)
+        if cmd[:2] == ("git", "config"):
+            return appmod.subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+        if cmd == ("git", "rev-parse", "--is-inside-work-tree"):
+            return appmod.subprocess.CompletedProcess(args, 0, stdout="true\n", stderr="")
+        if cmd == ("git", "fetch", "--quiet", "origin", "main"):
+            return appmod.subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+        if cmd == ("git", "rev-parse", "HEAD"):
+            return appmod.subprocess.CompletedProcess(args, 0, stdout="1111111111111111111111111111111111111111\n", stderr="")
+        if cmd == ("git", "rev-parse", "origin/main"):
+            return appmod.subprocess.CompletedProcess(args, 0, stdout="2222222222222222222222222222222222222222\n", stderr="")
+        if cmd == ("git", "rev-parse", "--abbrev-ref", "HEAD"):
+            return appmod.subprocess.CompletedProcess(args, 0, stdout="main\n", stderr="")
+        if cmd == ("git", "status", "--porcelain"):
+            return appmod.subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+        if cmd[:3] == ("git", "merge-base", "--is-ancestor"):
+            return appmod.subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+        raise AssertionError(args)
+
+    monkeypatch.setattr(appmod, "_run_app_update_cmd", fake_run)
+
+    result = appmod._app_update_check(fetch=True)
+
+    assert result["supported"] is True
+    assert result["update_available"] is True
+    assert result["can_update"] is True
+    assert result["current_short"] == "11111111"
+    assert result["remote_short"] == "22222222"
+
+
+def test_app_update_check_blocks_dirty_checkout(monkeypatch, tmp_path):
+    (tmp_path / ".git").mkdir()
+    monkeypatch.setattr(appmod, "APP_DIR", tmp_path)
+
+    def fake_run(args, *, timeout=30.0, check=True):
+        cmd = tuple(args)
+        if cmd[:2] == ("git", "config"):
+            return appmod.subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+        values = {
+            ("git", "rev-parse", "--is-inside-work-tree"): "true\n",
+            ("git", "rev-parse", "HEAD"): "1111111111111111111111111111111111111111\n",
+            ("git", "rev-parse", "origin/main"): "2222222222222222222222222222222222222222\n",
+            ("git", "rev-parse", "--abbrev-ref", "HEAD"): "main\n",
+            ("git", "status", "--porcelain"): " M main.py\n",
+        }
+        if cmd in values:
+            return appmod.subprocess.CompletedProcess(args, 0, stdout=values[cmd], stderr="")
+        if cmd[:3] == ("git", "merge-base", "--is-ancestor"):
+            return appmod.subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+        raise AssertionError(args)
+
+    monkeypatch.setattr(appmod, "_run_app_update_cmd", fake_run)
+
+    result = appmod._app_update_check(fetch=False)
+
+    assert result["update_available"] is True
+    assert result["can_update"] is False
+    assert result["dirty"] is True
+    assert "local changes" in result["message"]
+
+
+def test_apply_app_update_resets_to_origin_and_installs_requirements(monkeypatch, tmp_path):
+    (tmp_path / ".git").mkdir()
+    (tmp_path / "requirements.txt").write_text("fastapi\n")
+    monkeypatch.setattr(appmod, "APP_DIR", tmp_path)
+    monkeypatch.setattr(appmod, "APP_UPDATE_LOCK", appmod.threading.Lock())
+    calls = []
+
+    def fake_run(args, *, timeout=30.0, check=True):
+        calls.append(tuple(args))
+        cmd = tuple(args)
+        if cmd == ("git", "rev-parse", "--is-inside-work-tree"):
+            return appmod.subprocess.CompletedProcess(args, 0, stdout="true\n", stderr="")
+        if cmd == ("git", "fetch", "--quiet", "origin", "main"):
+            return appmod.subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+        if cmd == ("git", "rev-parse", "HEAD"):
+            stdout = "1111111111111111111111111111111111111111\n"
+            if ("git", "reset", "--hard", "origin/main") in calls:
+                stdout = "2222222222222222222222222222222222222222\n"
+            return appmod.subprocess.CompletedProcess(args, 0, stdout=stdout, stderr="")
+        if cmd == ("git", "rev-parse", "origin/main"):
+            return appmod.subprocess.CompletedProcess(args, 0, stdout="2222222222222222222222222222222222222222\n", stderr="")
+        if cmd == ("git", "rev-parse", "--abbrev-ref", "HEAD"):
+            return appmod.subprocess.CompletedProcess(args, 0, stdout="main\n", stderr="")
+        if cmd == ("git", "status", "--porcelain"):
+            return appmod.subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+        if cmd[:3] == ("git", "merge-base", "--is-ancestor"):
+            return appmod.subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+        if cmd[:2] == ("git", "config"):
+            return appmod.subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+        if cmd == ("git", "checkout", "-q", "main"):
+            return appmod.subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+        if cmd == ("git", "reset", "--hard", "origin/main"):
+            return appmod.subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+        if len(cmd) >= 4 and cmd[1:4] == ("-m", "pip", "install"):
+            return appmod.subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+        raise AssertionError(args)
+
+    monkeypatch.setattr(appmod, "_run_app_update_cmd", fake_run)
+    monkeypatch.setattr(appmod, "_schedule_app_restart", lambda delay_sec=2.0: calls.append(("restart", str(delay_sec))))
+
+    result = appmod._apply_app_update(schedule_restart=True)
+
+    assert result["started"] is True
+    assert result["restart_scheduled"] is True
+    assert ("git", "config", "--global", "--add", "safe.directory", str(tmp_path)) in calls
+    assert ("git", "checkout", "-q", "main") in calls
+    assert ("git", "reset", "--hard", "origin/main") in calls
+    assert any(cmd[1:4] == ("-m", "pip", "install") for cmd in calls)
+    assert ("restart", "2.0") in calls
+
+
 def test_gcode_parser_maps_orca_tool_indexes_to_cfs_slots(monkeypatch, state):
     monkeypatch.setattr(appmod, "mm_to_g", lambda material, mm: mm / 100.0)
 
