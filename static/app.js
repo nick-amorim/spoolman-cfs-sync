@@ -234,41 +234,51 @@ function setCStat(id, state, value) {
 
 /* ---------- CFS slot rendering ---------- */
 
-function slotStatusChip(meta, isActive) {
-  if (meta.present === false) return el("span", { class: "chip chip-muted", text: "empty" });
-  if (isActive) return el("span", { class: "chip chip-accent", text: "active" });
-  return el("span", { class: "chip chip-muted", text: "ready" });
+function cfsLabel(meta) {
+  if (meta.present === false) return "Empty slot";
+  return meta.name || meta.material || "Unnamed filament";
+}
+function cfsSubText(meta) {
+  const bits = ["CFS"];
+  if (meta.present === false) {
+    bits.push("Empty");
+  } else {
+    if (meta.material && meta.material !== "—") bits.push(meta.material);
+    if (meta.vendor) bits.push(meta.vendor);
+    if (meta.color) bits.push(meta.color);
+  }
+  return bits.join(" · ");
 }
 
-function buildSlotCard(state, slots, sid, isActive) {
-  const meta = slotMeta(state, slots, sid);
+function buildSlotCard(state, sid) {
   const cfg = state.spoolman_config || {};
   const mappings = cfg.slot_mappings || {};
   const mapped = mappings[sid];
   const spool = findSpool(mapped);
-  const swatch = el("div", { class: "slot-swatch" + (meta.present === false ? " absent" : "") });
-  if (meta.present !== false) swatch.style.background = meta.color;
+  const swatch = el("div", { class: "slot-swatch" + (!spool ? " absent" : "") });
+  if (spool) swatch.style.background = spoolColor(spool);
 
   const main = el("div", { class: "slot-main" });
   const idRow = el("div", { class: "slot-id-row" }, [
     el("span", { class: "slot-id", text: sid }),
-    slotStatusChip(meta, isActive),
+    el("span", { class: mapped ? "chip chip-ok" : "chip chip-muted", text: mapped ? "mapped" : "unmapped" }),
   ]);
   main.appendChild(idRow);
 
-  if (meta.present === false) {
-    main.appendChild(el("div", { class: "slot-name", text: "Empty slot" }));
+  if (spool) {
+    main.appendChild(el("div", { class: "slot-name", text: spoolDisplayName(spool) }));
+  } else if (mapped) {
+    main.appendChild(el("div", { class: "slot-name", text: "Loading Spoolman spool" }));
   } else {
-    main.appendChild(el("div", { class: "slot-name", text: meta.name || meta.material || "Unnamed filament" }));
+    main.appendChild(el("div", { class: "slot-name", text: "No Spoolman spool" }));
   }
 
-  const subBits = ["CFS"];
-  if (meta.present !== false) {
-    if (meta.material && meta.material !== "—") subBits.push(meta.material);
-    if (meta.vendor) subBits.push(meta.vendor);
-    if (meta.color) subBits.push(meta.color);
-  } else {
-    subBits.push("Empty");
+  const subBits = ["Spoolman"];
+  if (spool) {
+    const mat = spoolMaterial(spool);
+    const color = spoolColor(spool);
+    if (mat && mat !== "—") subBits.push(mat);
+    if (color) subBits.push(color);
   }
   main.appendChild(el("div", { class: "slot-sub", text: subBits.join(" · ") }));
 
@@ -277,14 +287,10 @@ function buildSlotCard(state, slots, sid, isActive) {
     mapping.appendChild(el("span", { class: "spool-tag", text: `#${mapped}` }));
     if (spool) {
       const sColor = spoolColor(spool);
-      const sMat = spoolMaterial(spool);
       mapping.appendChild(el("span", { class: "spool-mini-swatch", style: { background: sColor } }));
-      mapping.appendChild(el("span", {
-        class: "slot-mapping-text",
-        text: `Spoolman · ${spoolDisplayName(spool)}${sMat && sMat !== "—" ? " · " + sMat : ""} · ${sColor}`,
-      }));
+      mapping.appendChild(el("span", { class: "slot-mapping-text", text: "Mapped Spoolman spool" }));
     } else {
-      mapping.appendChild(el("span", { class: "slot-mapping-text", text: "Spoolman · loading…" }));
+      mapping.appendChild(el("span", { class: "slot-mapping-text", text: "Loading spool details..." }));
     }
   } else {
     mapping.appendChild(el("span", { class: "spool-unmapped", text: "No spool mapped" }));
@@ -292,29 +298,18 @@ function buildSlotCard(state, slots, sid, isActive) {
   main.appendChild(mapping);
 
   const spoolmanRem = spoolRemainingWeight(spool);
-  const localRem = meta.spool_remaining_g != null ? meta.spool_remaining_g : meta.remaining_g;
-  const rem = spool ? spoolmanRem : localRem;
   const remBox = el("div", { class: "slot-remaining" });
   if (spool) {
     remBox.appendChild(el("div", { class: "slot-remaining-value", text: spoolWeightText(spool) }));
     remBox.appendChild(el("div", { class: "slot-remaining-source", text: "Spoolman" }));
     remBox.title = "Spoolman remaining / initial weight";
-    const r = Number(rem);
-    if (Number.isFinite(r)) {
-      if (r <= 50) remBox.classList.add("crit");
-      else if (r <= 150) remBox.classList.add("low");
-    }
-  } else if (rem != null) {
-    const r = Number(rem);
-    remBox.appendChild(el("div", { class: "slot-remaining-value", text: fmtG(r) }));
-    remBox.appendChild(el("div", { class: "slot-remaining-source", text: "Local" }));
-    remBox.title = "Local remaining weight reference";
+    const r = Number(spoolmanRem);
     if (Number.isFinite(r)) {
       if (r <= 50) remBox.classList.add("crit");
       else if (r <= 150) remBox.classList.add("low");
     }
   } else {
-    remBox.textContent = "—";
+    remBox.textContent = "Not mapped";
     remBox.style.color = "var(--text-mute)";
   }
 
@@ -348,7 +343,7 @@ function buildSlotCard(state, slots, sid, isActive) {
   });
   actions.appendChild(bookBtn);
 
-  const card = el("div", { class: "slot-card" + (isActive ? " is-active" : "") }, [swatch, main, remBox, actions]);
+  const card = el("div", { class: "slot-card" }, [swatch, main, remBox, actions]);
   card.dataset.slot = sid;
   return card;
 }
@@ -818,7 +813,26 @@ function renderMoonHistory(state) {
 
 /* ---------- active job ---------- */
 
-function renderActiveJob(state, slots) {
+function buildCfsStripItem(state, slots, sid, isActive) {
+  const meta = slotMeta(state, slots, sid);
+  const item = el("div", { class: "cfs-strip-item" + (isActive ? " is-active" : "") + (meta.present === false ? " is-empty" : "") });
+  const swatch = el("span", { class: "cfs-strip-swatch" + (meta.present === false ? " absent" : "") });
+  if (meta.present !== false) swatch.style.background = meta.color;
+  item.appendChild(swatch);
+  item.appendChild(el("span", { class: "cfs-strip-id", text: sid }));
+  item.appendChild(el("span", { class: "cfs-strip-name", text: cfsLabel(meta) }));
+  return item;
+}
+
+function buildCfsStrip(state, slots, connectedBoxes, active) {
+  const strip = el("div", { class: "cfs-strip" });
+  for (const sid of buildSlotIds(connectedBoxes)) {
+    strip.appendChild(buildCfsStripItem(state, slots, sid, sid === active));
+  }
+  return strip;
+}
+
+function renderActiveJob(state, slots, connectedBoxes) {
   const body = $("jobBody");
   const meta = $("jobMeta");
   if (!body) return;
@@ -829,24 +843,26 @@ function renderActiveJob(state, slots) {
   const jobName = state.job_track_name || state.current_job || "";
 
   if (!active || !(slots?.[active] || state.slots?.[active])) {
-    if (meta) meta.textContent = isPrinting ? "Printing · no CFS slot reported" : "Idle";
+    if (meta) meta.textContent = isPrinting ? "Printing · no CFS slot reported" : "No active CFS slot";
     body.appendChild(el("div", { class: "job-empty", text: isPrinting
       ? `Printing ${jobName || "(unnamed job)"} — CFS has not reported an active slot.`
-      : "No active print · no CFS slot selected." }));
+      : "No active CFS slot selected." }));
+    body.appendChild(buildCfsStrip(state, slots, connectedBoxes, active));
     return;
   }
 
   const m = slotMeta(state, slots, active);
-  if (meta) meta.textContent = isPrinting ? "Printing now" : "Ready";
+  if (meta) meta.textContent = isPrinting ? "Printing now" : "CFS ready";
 
   const slotMm = state.job_track_slot_mm && typeof state.job_track_slot_mm === "object" ? Number(state.job_track_slot_mm[active] || 0) : 0;
   const slotG  = state.job_track_slot_g  && typeof state.job_track_slot_g  === "object" ? Number(state.job_track_slot_g[active]  || 0) : 0;
 
   const swatch = el("div", { class: "job-swatch", style: { background: m.color } });
   const main = el("div", { class: "job-main" }, [
-    el("div", { class: "job-slot-id", text: `BOX ${active[0]} · SLOT ${active[1]}` }),
-    el("div", { class: "job-name", text: jobName || "(no active job)" }),
-    el("div", { class: "job-sub", text: [m.name, m.material, m.vendor].filter(Boolean).join(" · ") || m.color }),
+    el("div", { class: "job-slot-id", text: `CFS SLOT ${active}` }),
+    el("div", { class: "job-name", text: cfsLabel(m) }),
+    el("div", { class: "job-sub", text: cfsSubText(m) }),
+    el("div", { class: "job-print", text: isPrinting ? `Printing ${jobName || "(unnamed job)"}` : "No active print" }),
   ]);
 
   let live = null;
@@ -857,6 +873,7 @@ function renderActiveJob(state, slots) {
     ]);
   }
   body.appendChild(el("div", { class: "job-active" }, [swatch, main, live]));
+  body.appendChild(buildCfsStrip(state, slots, connectedBoxes, active));
 }
 
 /* ---------- warnings ---------- */
@@ -907,12 +924,16 @@ function render(state) {
   // Slots / boxes
   const slots = (state.cfs_slots && Object.keys(state.cfs_slots).length) ? state.cfs_slots : state.slots;
   const connectedBoxes = connectedBoxesFor(slots);
-  const active = state.cfs_active_slot || null;
 
   ensureSpoolmanSpoolsLoadedForPanel(scfg);
 
   const cfsMetaNode = $("cfsMeta");
-  if (cfsMetaNode) cfsMetaNode.textContent = `${connectedBoxes.length} box${connectedBoxes.length === 1 ? "" : "es"} · ${connectedBoxes.length * 4} slots`;
+  if (cfsMetaNode) {
+    const mappings = scfg.slot_mappings || {};
+    const slotIds = buildSlotIds(connectedBoxes);
+    const mappedCount = slotIds.filter((sid) => Number(mappings[sid] || 0) > 0).length;
+    cfsMetaNode.textContent = `${mappedCount}/${slotIds.length} mapped`;
+  }
 
   const grid = $("cfsGrid");
   if (grid) {
@@ -931,13 +952,13 @@ function render(state) {
       const slotsWrap = el("div", { class: "cfs-slots" });
       for (const letter of ["A","B","C","D"]) {
         const sid = `${boxNum}${letter}`;
-        slotsWrap.appendChild(buildSlotCard(state, slots, sid, sid === active));
+        slotsWrap.appendChild(buildSlotCard(state, sid));
       }
       grid.appendChild(el("div", { class: "cfs-box" }, [head, slotsWrap]));
     }
   }
 
-  renderActiveJob(state, slots);
+  renderActiveJob(state, slots, connectedBoxes);
   renderSyncRecords(state);
   renderHistory(state, slots, connectedBoxes);
   renderMoonHistory(state);
