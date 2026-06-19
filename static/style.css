@@ -354,8 +354,18 @@ a { color: var(--accent); }
   font-style: italic; color: var(--text-mute);
 }
 .slot-remaining {
-  font-family: var(--font-mono); font-weight: 700; font-size: 14px;
-  text-align: right; min-width: 64px;
+  text-align: right; min-width: 96px;
+}
+.slot-remaining-value {
+  font-family: var(--font-mono); font-weight: 700; font-size: 13px;
+  white-space: nowrap;
+}
+.slot-remaining-source {
+  margin-top: 2px;
+  font-size: 10px;
+  color: var(--text-mute);
+  text-transform: uppercase;
+  letter-spacing: .04em;
 }
 .slot-remaining.low  { color: var(--warn); }
 .slot-remaining.crit { color: var(--bad); }

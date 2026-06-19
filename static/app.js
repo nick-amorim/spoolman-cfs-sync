@@ -173,6 +173,12 @@ function spoolWeightText(spool) {
   const left = remaining != null ? fmtG(remaining) : "—";
   return initial != null ? `${left} / ${fmtG(initial)}` : left;
 }
+function spoolRemainingWeight(spool) {
+  if (!spool) return null;
+  const value = spool.remaining_weight ?? spool.remaining_weight_g ?? spool.weight_remaining;
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : null;
+}
 function findSpool(id) {
   const sid = Number(id || 0);
   if (!sid) return null;
@@ -278,11 +284,24 @@ function buildSlotCard(state, slots, sid, isActive) {
   }
   main.appendChild(mapping);
 
-  const rem = meta.spool_remaining_g != null ? meta.spool_remaining_g : meta.remaining_g;
+  const spoolmanRem = spoolRemainingWeight(spool);
+  const localRem = meta.spool_remaining_g != null ? meta.spool_remaining_g : meta.remaining_g;
+  const rem = spool ? spoolmanRem : localRem;
   const remBox = el("div", { class: "slot-remaining" });
-  if (rem != null) {
+  if (spool) {
+    remBox.appendChild(el("div", { class: "slot-remaining-value", text: spoolWeightText(spool) }));
+    remBox.appendChild(el("div", { class: "slot-remaining-source", text: "Spoolman" }));
+    remBox.title = "Spoolman remaining / initial weight";
     const r = Number(rem);
-    remBox.textContent = fmtG(r);
+    if (Number.isFinite(r)) {
+      if (r <= 50) remBox.classList.add("crit");
+      else if (r <= 150) remBox.classList.add("low");
+    }
+  } else if (rem != null) {
+    const r = Number(rem);
+    remBox.appendChild(el("div", { class: "slot-remaining-value", text: fmtG(r) }));
+    remBox.appendChild(el("div", { class: "slot-remaining-source", text: "Local" }));
+    remBox.title = "Local remaining weight reference";
     if (Number.isFinite(r)) {
       if (r <= 50) remBox.classList.add("crit");
       else if (r <= 150) remBox.classList.add("low");
