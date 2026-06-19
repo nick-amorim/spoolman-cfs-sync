@@ -350,6 +350,18 @@ a { color: var(--accent); }
   background: var(--info-bg); color: var(--info);
   border: 1px solid var(--info-line);
 }
+.slot-mapping .spool-mini-swatch {
+  width: 12px; height: 12px; border-radius: 3px;
+  border: 1px solid var(--line-strong);
+  display: inline-block;
+  flex: 0 0 auto;
+}
+.slot-mapping-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .slot-mapping .spool-unmapped {
   font-style: italic; color: var(--text-mute);
 }
