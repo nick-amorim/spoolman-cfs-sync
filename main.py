@@ -259,45 +259,46 @@ def _parse_iso_ts(val: str) -> Optional[float]:
         return None
 
 
+def _write_json_atomic(path: Path, data: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.tmp")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+    tmp.replace(path)
+
+
 def _ensure_data_files() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     STATIC_DIR.mkdir(parents=True, exist_ok=True)
 
     if not PROFILES_PATH.exists():
-        PROFILES_PATH.write_text(
-            json.dumps(
-                {
-                    "PLA": {"density_g_cm3": 1.24, "notes": "Default profile"},
-                    "ABS": {"density_g_cm3": 1.04, "notes": "Default profile"},
-                    "PETG": {"density_g_cm3": 1.27, "notes": "Default profile"},
-                    "TPU": {"density_g_cm3": 1.20, "notes": "Default profile"},
-                    "ASA": {"density_g_cm3": 1.07, "notes": "Default profile"},
-                    "PA": {"density_g_cm3": 1.15, "notes": "Default profile"},
-                    "PC": {"density_g_cm3": 1.20, "notes": "Default profile"},
-                    "OTHER": {"density_g_cm3": 1.20, "notes": "Fallback"},
-                },
-                indent=2,
-                ensure_ascii=False,
-            )
+        _write_json_atomic(
+            PROFILES_PATH,
+            {
+                "PLA": {"density_g_cm3": 1.24, "notes": "Default profile"},
+                "ABS": {"density_g_cm3": 1.04, "notes": "Default profile"},
+                "PETG": {"density_g_cm3": 1.27, "notes": "Default profile"},
+                "TPU": {"density_g_cm3": 1.20, "notes": "Default profile"},
+                "ASA": {"density_g_cm3": 1.07, "notes": "Default profile"},
+                "PA": {"density_g_cm3": 1.15, "notes": "Default profile"},
+                "PC": {"density_g_cm3": 1.20, "notes": "Default profile"},
+                "OTHER": {"density_g_cm3": 1.20, "notes": "Fallback"},
+            },
         )
 
     if not CONFIG_PATH.exists():
-        CONFIG_PATH.write_text(
-            json.dumps(
-                {
-                    # Optional: set this to enable automatic job usage reading from Moonraker
-                    # Example: "http://PRINTER_IP:7125"
-                    "moonraker_url": "",
-                    "poll_interval_sec": 5,
-                    # Filament diameter used for mm->g conversion
-                    "filament_diameter_mm": 1.75,
-                    # If true, import material/color/name from detected CFS objects into local slots (read-only to printer)
-                    "cfs_autosync": False,
-                    "spoolman": _default_spoolman_config(),
-                },
-                indent=2,
-                ensure_ascii=False,
-            )
+        _write_json_atomic(
+            CONFIG_PATH,
+            {
+                # Optional: set this to enable automatic job usage reading from Moonraker
+                # Example: "http://PRINTER_IP:7125"
+                "moonraker_url": "",
+                "poll_interval_sec": 5,
+                # Filament diameter used for mm->g conversion
+                "filament_diameter_mm": 1.75,
+                # If true, import material/color/name from detected CFS objects into local slots (read-only to printer)
+                "cfs_autosync": False,
+                "spoolman": _default_spoolman_config(),
+            },
         )
 
     if not STATE_PATH.exists():
@@ -343,7 +344,7 @@ def _ensure_data_files() -> None:
             "spoolman_sync_records": {},
             "updated_at": _now(),
         }
-        STATE_PATH.write_text(json.dumps(state, indent=2, ensure_ascii=False))
+        _write_json_atomic(STATE_PATH, state)
 
 
 def load_profiles() -> dict:
@@ -524,7 +525,7 @@ def _job_key(job_id: str, ts_end: Optional[float], job: str) -> str:
 
 def save_state(state: AppState) -> None:
     state.updated_at = _now()
-    STATE_PATH.write_text(json.dumps(_model_dump(state), indent=2, ensure_ascii=False))
+    _write_json_atomic(STATE_PATH, _model_dump(state))
 
 
 # --- Printer adapter (Dummy) ---
@@ -1350,7 +1351,7 @@ def _update_spoolman_config(update: dict) -> dict:
         if key in update and update[key] is not None:
             raw[key] = update[key]
     cfg["spoolman"] = _normalize_spoolman_config({"spoolman": raw})
-    CONFIG_PATH.write_text(json.dumps(cfg, indent=2, ensure_ascii=False))
+    _write_json_atomic(CONFIG_PATH, cfg)
     return _normalize_spoolman_config(cfg)
 
 
@@ -1365,7 +1366,7 @@ def _update_printer_config(update: dict) -> dict:
     normalized = _normalize_printer_config(raw)
     cfg.update(normalized)
     cfg.setdefault("spoolman", _default_spoolman_config())
-    CONFIG_PATH.write_text(json.dumps(cfg, indent=2, ensure_ascii=False))
+    _write_json_atomic(CONFIG_PATH, cfg)
     return normalized
 
 
@@ -1381,7 +1382,7 @@ def _update_spoolman_mapping(slot_id: str, spool_id: Optional[int]) -> dict:
     raw = dict(raw)
     raw["slot_mappings"] = mappings
     cfg["spoolman"] = _normalize_spoolman_config({"spoolman": raw})
-    CONFIG_PATH.write_text(json.dumps(cfg, indent=2, ensure_ascii=False))
+    _write_json_atomic(CONFIG_PATH, cfg)
     return _normalize_spoolman_config(cfg)
 
 

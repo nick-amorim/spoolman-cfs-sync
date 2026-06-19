@@ -100,6 +100,19 @@ def test_update_printer_config_preserves_spoolman_settings(monkeypatch, tmp_path
     assert saved["spoolman"]["slot_mappings"]["1A"] == 16
 
 
+def test_save_state_writes_valid_json_without_leaving_temp_file(monkeypatch, tmp_path):
+    state_path = tmp_path / "data" / "state.json"
+    monkeypatch.setattr(appmod, "STATE_PATH", state_path)
+    st = appmod.default_state()
+    st.current_job = "part.gcode"
+
+    appmod.save_state(st)
+
+    saved = json.loads(state_path.read_text())
+    assert saved["current_job"] == "part.gcode"
+    assert not state_path.with_name("state.json.tmp").exists()
+
+
 def test_stable_print_key_prefers_moonraker_job_id():
     assert appmod._stable_print_key("part.gcode", 10, 20, job_id="abc-123") == "moonraker:abc-123"
     assert appmod._stable_print_key("part.gcode", 10.4, 20.9) == "local:part.gcode:10:20"
