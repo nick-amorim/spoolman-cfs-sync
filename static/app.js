@@ -250,11 +250,12 @@ function cfsSubText(meta) {
   return bits.join(" · ");
 }
 
-function buildSlotCard(state, sid) {
+function buildSlotCard(state, slots, sid) {
   const cfg = state.spoolman_config || {};
   const mappings = cfg.slot_mappings || {};
   const mapped = mappings[sid];
   const spool = findSpool(mapped);
+  const meta = slotMeta(state, slots, sid);
   const swatch = el("div", { class: "slot-swatch" + (!spool ? " absent" : "") });
   if (spool) swatch.style.background = spoolColor(spool);
 
@@ -285,12 +286,14 @@ function buildSlotCard(state, sid) {
   const mapping = el("div", { class: "slot-mapping" });
   if (mapped) {
     mapping.appendChild(el("span", { class: "spool-tag", text: `#${mapped}` }));
-    if (spool) {
-      const sColor = spoolColor(spool);
-      mapping.appendChild(el("span", { class: "spool-mini-swatch", style: { background: sColor } }));
-      mapping.appendChild(el("span", { class: "slot-mapping-text", text: "Mapped Spoolman spool" }));
+    const cfsSwatchClass = "spool-mini-swatch" + (meta.present === false ? " absent" : "");
+    const cfsSwatch = el("span", { class: cfsSwatchClass });
+    if (meta.present !== false && meta.color) cfsSwatch.style.background = meta.color;
+    mapping.appendChild(cfsSwatch);
+    if (meta.present === false) {
+      mapping.appendChild(el("span", { class: "slot-mapping-text", text: "CFS empty slot" }));
     } else {
-      mapping.appendChild(el("span", { class: "slot-mapping-text", text: "Loading spool details..." }));
+      mapping.appendChild(el("span", { class: "slot-mapping-text", text: cfsSubText(meta) }));
     }
   } else {
     mapping.appendChild(el("span", { class: "spool-unmapped", text: "No spool mapped" }));
@@ -952,7 +955,7 @@ function render(state) {
       const slotsWrap = el("div", { class: "cfs-slots" });
       for (const letter of ["A","B","C","D"]) {
         const sid = `${boxNum}${letter}`;
-        slotsWrap.appendChild(buildSlotCard(state, sid));
+        slotsWrap.appendChild(buildSlotCard(state, slots, sid));
       }
       grid.appendChild(el("div", { class: "cfs-box" }, [head, slotsWrap]));
     }
