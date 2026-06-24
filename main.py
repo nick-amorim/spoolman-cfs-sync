@@ -1390,6 +1390,17 @@ def _short_commit(value: str) -> str:
     return str(value or "").strip()[:8]
 
 
+def _app_update_env() -> dict[str, str]:
+    env = os.environ.copy()
+    home = APP_DIR / "data" / "home"
+    try:
+        home.mkdir(parents=True, exist_ok=True)
+        env["HOME"] = str(home)
+    except OSError:
+        pass
+    return env
+
+
 def _run_app_update_cmd(args: list[str], *, timeout: float = 30.0, check: bool = True) -> subprocess.CompletedProcess:
     proc = subprocess.run(
         args,
@@ -1397,6 +1408,7 @@ def _run_app_update_cmd(args: list[str], *, timeout: float = 30.0, check: bool =
         capture_output=True,
         text=True,
         timeout=timeout,
+        env=_app_update_env(),
     )
     if check and proc.returncode != 0:
         output = "\n".join(part.strip() for part in (proc.stdout, proc.stderr) if part and part.strip())
@@ -1412,6 +1424,21 @@ def _app_update_stdout(args: list[str], *, timeout: float = 30.0) -> str:
 def _app_update_success(args: list[str], *, timeout: float = 30.0) -> bool:
     proc = _run_app_update_cmd(args, timeout=timeout, check=False)
     return proc.returncode == 0
+
+
+def _app_update_changed_files() -> list[str]:
+    proc = _run_app_update_cmd(["git", "status", "--porcelain", "--untracked-files=no"], timeout=10, check=True)
+    status = str(proc.stdout or "")
+    changed: list[str] = []
+    for line in status.splitlines():
+        if not line:
+            continue
+        path = line[3:].strip()
+        if " -> " in path:
+            path = path.rsplit(" -> ", 1)[-1]
+        if path:
+            changed.append(path)
+    return changed
 
 
 def _trust_app_update_dir() -> None:
@@ -1435,7 +1462,8 @@ def _app_update_check(fetch: bool = True) -> dict:
     current = _app_update_stdout(["git", "rev-parse", "HEAD"], timeout=10)
     remote = _app_update_stdout(["git", "rev-parse", "origin/main"], timeout=10)
     branch = _app_update_stdout(["git", "rev-parse", "--abbrev-ref", "HEAD"], timeout=10)
-    dirty = bool(_app_update_stdout(["git", "status", "--porcelain"], timeout=10))
+    changed_files = _app_update_changed_files()
+    dirty = bool(changed_files)
     update_available = bool(current and remote and current != remote)
     current_is_ancestor = _app_update_success(["git", "merge-base", "--is-ancestor", current, remote], timeout=10)
 
@@ -1459,6 +1487,7 @@ def _app_update_check(fetch: bool = True) -> dict:
         "update_available": update_available,
         "can_update": can_update,
         "dirty": dirty,
+        "changed_files": changed_files,
         "diverged": bool(update_available and not current_is_ancestor),
         "checked_at": _now(),
         "message": message,

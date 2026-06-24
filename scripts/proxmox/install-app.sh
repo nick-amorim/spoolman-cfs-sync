@@ -117,7 +117,7 @@ install_python_deps() {
 }
 
 write_initial_config() {
-  mkdir -p "${APP_DIR}/data"
+  mkdir -p "${APP_DIR}/data/home"
   if [[ -f "${APP_DIR}/data/config.json" ]]; then
     chown -R "$APP_USER:$APP_USER" "${APP_DIR}/data"
     return 0
@@ -174,6 +174,7 @@ Type=simple
 User=${APP_USER}
 Group=${APP_USER}
 WorkingDirectory=${APP_DIR}
+Environment=HOME=${APP_DIR}/data/home
 ExecStart=${APP_DIR}/.venv/bin/uvicorn main:app --host 0.0.0.0 --port ${APP_PORT}
 Restart=always
 RestartSec=5
