@@ -395,6 +395,10 @@ a { color: var(--accent); }
   display: inline-block;
   flex: 0 0 auto;
 }
+.slot-mapping .spool-mini-swatch.absent {
+  background:
+    repeating-linear-gradient(45deg, var(--surface-3), var(--surface-3) 3px, var(--surface-2) 3px, var(--surface-2) 6px);
+}
 .slot-mapping-text {
   min-width: 0;
   overflow: hidden;
