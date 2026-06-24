@@ -220,7 +220,7 @@ def test_app_update_check_reports_available_clean_checkout(monkeypatch, tmp_path
             return appmod.subprocess.CompletedProcess(args, 0, stdout="2222222222222222222222222222222222222222\n", stderr="")
         if cmd == ("git", "rev-parse", "--abbrev-ref", "HEAD"):
             return appmod.subprocess.CompletedProcess(args, 0, stdout="main\n", stderr="")
-        if cmd == ("git", "status", "--porcelain"):
+        if cmd == ("git", "status", "--porcelain", "--untracked-files=no"):
             return appmod.subprocess.CompletedProcess(args, 0, stdout="", stderr="")
         if cmd[:3] == ("git", "merge-base", "--is-ancestor"):
             return appmod.subprocess.CompletedProcess(args, 0, stdout="", stderr="")
@@ -235,6 +235,38 @@ def test_app_update_check_reports_available_clean_checkout(monkeypatch, tmp_path
     assert result["can_update"] is True
     assert result["current_short"] == "11111111"
     assert result["remote_short"] == "22222222"
+    assert result["changed_files"] == []
+
+
+def test_app_update_check_ignores_untracked_checkout_files(monkeypatch, tmp_path):
+    (tmp_path / ".git").mkdir()
+    monkeypatch.setattr(appmod, "APP_DIR", tmp_path)
+
+    def fake_run(args, *, timeout=30.0, check=True):
+        cmd = tuple(args)
+        if cmd[:2] == ("git", "config"):
+            return appmod.subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+        values = {
+            ("git", "rev-parse", "--is-inside-work-tree"): "true\n",
+            ("git", "rev-parse", "HEAD"): "1111111111111111111111111111111111111111\n",
+            ("git", "rev-parse", "origin/main"): "2222222222222222222222222222222222222222\n",
+            ("git", "rev-parse", "--abbrev-ref", "HEAD"): "main\n",
+            ("git", "status", "--porcelain", "--untracked-files=no"): "",
+        }
+        if cmd in values:
+            return appmod.subprocess.CompletedProcess(args, 0, stdout=values[cmd], stderr="")
+        if cmd[:3] == ("git", "merge-base", "--is-ancestor"):
+            return appmod.subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+        raise AssertionError(args)
+
+    monkeypatch.setattr(appmod, "_run_app_update_cmd", fake_run)
+
+    result = appmod._app_update_check(fetch=False)
+
+    assert result["update_available"] is True
+    assert result["can_update"] is True
+    assert result["dirty"] is False
+    assert result["changed_files"] == []
 
 
 def test_app_update_check_blocks_dirty_checkout(monkeypatch, tmp_path):
@@ -250,7 +282,7 @@ def test_app_update_check_blocks_dirty_checkout(monkeypatch, tmp_path):
             ("git", "rev-parse", "HEAD"): "1111111111111111111111111111111111111111\n",
             ("git", "rev-parse", "origin/main"): "2222222222222222222222222222222222222222\n",
             ("git", "rev-parse", "--abbrev-ref", "HEAD"): "main\n",
-            ("git", "status", "--porcelain"): " M main.py\n",
+            ("git", "status", "--porcelain", "--untracked-files=no"): " M main.py\n",
         }
         if cmd in values:
             return appmod.subprocess.CompletedProcess(args, 0, stdout=values[cmd], stderr="")
@@ -265,6 +297,7 @@ def test_app_update_check_blocks_dirty_checkout(monkeypatch, tmp_path):
     assert result["update_available"] is True
     assert result["can_update"] is False
     assert result["dirty"] is True
+    assert result["changed_files"] == ["main.py"]
     assert "local changes" in result["message"]
 
 
@@ -291,7 +324,7 @@ def test_apply_app_update_resets_to_origin_and_installs_requirements(monkeypatch
             return appmod.subprocess.CompletedProcess(args, 0, stdout="2222222222222222222222222222222222222222\n", stderr="")
         if cmd == ("git", "rev-parse", "--abbrev-ref", "HEAD"):
             return appmod.subprocess.CompletedProcess(args, 0, stdout="main\n", stderr="")
-        if cmd == ("git", "status", "--porcelain"):
+        if cmd == ("git", "status", "--porcelain", "--untracked-files=no"):
             return appmod.subprocess.CompletedProcess(args, 0, stdout="", stderr="")
         if cmd[:3] == ("git", "merge-base", "--is-ancestor"):
             return appmod.subprocess.CompletedProcess(args, 0, stdout="", stderr="")
