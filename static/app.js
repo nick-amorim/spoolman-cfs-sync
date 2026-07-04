@@ -649,94 +649,14 @@ function syncStatusKind(status) {
   return { key: "skipped", label: s || "unknown" };
 }
 
-const SYNC_DEFAULT = 6;
-const SYNC_HARD_MAX = 50;
-let syncExpanded = false;
-
-function renderLegacySyncRecords(state) {
-  const wrap = $("auditList");
-  const meta = $("auditMeta");
-  if (!wrap) return;
-  wrap.innerHTML = "";
-  const cfg = state.spoolman_config || {};
-  const status = state.spoolman_status || {};
-  const records = state.spoolman_sync_records || {};
-
-  const enabled = cfg.enabled === true;
-  const dryRun  = cfg.dry_run !== false;
-  const syncMode = cfg.sync_mode === "live" ? "live" : "post-print";
-  const mode = enabled && !dryRun ? "writes enabled" : (enabled && dryRun ? "dry-run" : "disabled");
-  if (meta) {
-    meta.innerHTML = "";
-    meta.appendChild(el("span", { class: "chip " + (enabled && !dryRun ? "chip-ok" : (enabled ? "chip-warn" : "chip-muted")), text: mode }));
-    meta.appendChild(el("span", { class: "chip chip-muted", text: syncMode }));
-    if (status.connected) meta.appendChild(el("span", { class: "chip chip-ok", text: "reachable" }));
-  }
-
-  const allEntries = Object.entries(records)
-    .map(([k, r]) => [k, r || {}])
-    .sort((a, b) => Number(b[1].updated_at || b[1].finished_at || 0) - Number(a[1].updated_at || a[1].finished_at || 0))
-    .slice(0, SYNC_HARD_MAX);
-
-  if (!allEntries.length) return;
-
-  const entries = syncExpanded ? allEntries : allEntries.slice(0, SYNC_DEFAULT);
-
-  for (const [key, rec] of entries) {
-    const kind = syncStatusKind(rec.status);
-    const row = el("div", { class: "sync-row" });
-    row.appendChild(el("span", { class: "slot-id", text: rec.slot || "?" }));
-    row.appendChild(el("span", { class: "sync-arrow", text: "→" }));
-    const info = el("div", { class: "sync-info" }, [
-      el("div", { class: "sync-amount", text: `${rec.spool_id ? "#" + rec.spool_id : "unmapped"} · ${fmtMm(rec.used_mm || 0)}${rec.used_g ? ` · ${fmtG(rec.used_g)}` : ""}` }),
-      el("div", { class: "sync-job", text: `${rec.sync_phase ? rec.sync_phase + " · " : ""}${rec.job || "(unnamed job)"} · ${fmtAgo(rec.updated_at || rec.finished_at)}` }),
-    ]);
-    row.appendChild(info);
-    row.appendChild(el("span", { class: "status-chip", attrs: { "data-status": kind.key }, text: kind.label }));
-
-    // Safety: never offer retry for live-phase records, never for timeout/uncertain/conflict.
-    // The backend is also the final authority — unmapped slots are never written to Spoolman.
-    const retryableStatuses = ["failed", "pending", "skipped_invalid_spool", "skipped_unmapped", "dry_run"];
-    const canRetry =
-      rec.sync_phase !== "live" &&
-      kind.key !== "timeout" &&
-      retryableStatuses.includes(String(rec.status || ""));
-    if (canRetry) {
-      row.appendChild(el("button", {
-        class: "btn btn-secondary btn-mini",
-        attrs: { type: "button" },
-        text: "Sync now",
-        on: { click: async () => {
-          await postJson("/api/ui/spoolman/retry", { record_key: key });
-          await tick();
-        } },
-      }));
-    } else {
-      row.appendChild(el("span"));
-    }
-
-    if (rec.error) {
-      row.appendChild(el("div", { class: "sync-err", text: String(rec.error).slice(0, 280) }));
-    }
-    if (kind.key === "timeout") row.style.borderColor = "var(--danger)";
-    wrap.appendChild(row);
-  }
-
-  if (allEntries.length > SYNC_DEFAULT) {
-    const extra = allEntries.length - SYNC_DEFAULT;
-    wrap.appendChild(el("button", {
-      class: "btn btn-ghost btn-mini sync-more",
-      attrs: { type: "button" },
-      text: syncExpanded ? "Show less" : `Show all (${extra} more)`,
-      on: { click: () => {
-        syncExpanded = !syncExpanded;
-        if (latestState) render(latestState);
-      } },
-    }));
-  }
-}
-
 /* ---------- print audits ---------- */
+
+const AUDIT_DEFAULT = 6;
+const AUDIT_PAGE_SIZE = 10;
+const LEGACY_DEFAULT = 4;
+const LEGACY_PAGE_SIZE = 10;
+let auditVisibleCount = AUDIT_DEFAULT;
+let legacyVisibleCount = LEGACY_DEFAULT;
 
 function auditVerdictKind(verdict) {
   const value = String(verdict || "inconclusive");
@@ -766,7 +686,7 @@ function closeAuditModal() {
 async function retryAuditRecord(recordKey, auditId) {
   await postJson("/api/ui/spoolman/retry", { record_key: recordKey });
   await tick();
-  await openAuditModal(auditId);
+  if (auditId) await openAuditModal(auditId);
 }
 
 function auditSnapshotValue(snapshot, key, formatter) {
@@ -887,7 +807,7 @@ function renderPrintAudits(state) {
   const legacy = Array.isArray(latestAuditPayload.legacy_records) ? latestAuditPayload.legacy_records : [];
   if (meta) meta.textContent = `${audits.length} prints${legacy.length ? ` · ${legacy.length} legacy` : ""}`;
 
-  for (const audit of audits) {
+  for (const audit of audits.slice(0, auditVisibleCount)) {
     const verdict = auditVerdictKind(audit.verdict);
     const row = el("button", {
       class: "audit-row",
@@ -905,17 +825,76 @@ function renderPrintAudits(state) {
     wrap.appendChild(row);
   }
 
-  for (const record of legacy.slice(0, 10)) {
+  for (const record of legacy.slice(0, legacyVisibleCount)) {
     const kind = syncStatusKind(record.status);
-    wrap.appendChild(el("div", { class: "audit-row audit-row-legacy" }, [
+    const row = el("div", { class: "audit-row audit-row-legacy" }, [
       el("div", { class: "audit-row-main" }, [
         el("strong", { text: record.job || "Legacy sync record" }),
         el("span", { text: `${record.slot || "?"} → ${record.spool_id ? "#" + record.spool_id : "unmapped"} · ${auditMetric(record.used_mm)}` }),
       ]),
       el("span", { class: "chip chip-muted", text: "legacy — no audit verdict" }),
       el("span", { class: "status-chip", attrs: { "data-status": kind.key }, text: kind.label }),
-    ]));
+    ]);
+    const retryable = ["failed", "pending", "skipped_invalid_spool", "skipped_unmapped", "dry_run"].includes(String(record.status || ""));
+    if (record.sync_phase !== "live" && kind.key !== "timeout" && retryable) {
+      row.appendChild(el("button", {
+        class: "btn btn-secondary btn-mini",
+        attrs: { type: "button" },
+        text: "Sync now",
+        on: { click: () => retryAuditRecord(record.record_key, null) },
+      }));
+    } else {
+      row.appendChild(el("span"));
+    }
+    wrap.appendChild(row);
   }
+
+  const pager = el("div", { class: "audit-pager" });
+  if (auditVisibleCount < audits.length) {
+    pager.appendChild(el("button", {
+      class: "btn btn-ghost btn-mini",
+      attrs: { type: "button" },
+      text: `Show more audits (${audits.length - auditVisibleCount} remaining)`,
+      on: { click: () => {
+        auditVisibleCount += AUDIT_PAGE_SIZE;
+        renderPrintAudits(latestState || state);
+      } },
+    }));
+  }
+  if (auditVisibleCount > AUDIT_DEFAULT) {
+    pager.appendChild(el("button", {
+      class: "btn btn-ghost btn-mini",
+      attrs: { type: "button" },
+      text: "Show fewer audits",
+      on: { click: () => {
+        auditVisibleCount = AUDIT_DEFAULT;
+        renderPrintAudits(latestState || state);
+      } },
+    }));
+  }
+  if (legacyVisibleCount < legacy.length) {
+    pager.appendChild(el("button", {
+      class: "btn btn-ghost btn-mini",
+      attrs: { type: "button" },
+      text: `Show more legacy (${legacy.length - legacyVisibleCount} remaining)`,
+      on: { click: () => {
+        legacyVisibleCount += LEGACY_PAGE_SIZE;
+        renderPrintAudits(latestState || state);
+      } },
+    }));
+  }
+  if (legacyVisibleCount > LEGACY_DEFAULT) {
+    pager.appendChild(el("button", {
+      class: "btn btn-ghost btn-mini",
+      attrs: { type: "button" },
+      text: "Show fewer legacy",
+      on: { click: () => {
+        legacyVisibleCount = LEGACY_DEFAULT;
+        renderPrintAudits(latestState || state);
+      } },
+    }));
+  }
+  if (pager.childNodes.length) wrap.appendChild(pager);
 }
 
 /* ---------- history ---------- */

@@ -119,9 +119,14 @@ inventory manually before deciding what to do.
 
 When a Spoolman URL and at least one slot mapping are configured, the app
 automatically opens a print audit. Before the first possible write it freezes
-the slot mappings and sync settings, then snapshots each distinct mapped spool.
-This means mapping or settings changes made during a print cannot redirect that
-print's automatic deductions.
+the Spoolman server URL, slot mappings, and sync settings, then snapshots each
+distinct mapped spool. This means server or mapping changes made during a print
+cannot redirect that print's automatic deductions.
+
+Current safety controls remain authoritative in the safer direction: disabling
+sync or enabling dry-run immediately stops real writes for an active print.
+Re-enabling sync or disabling dry-run cannot arm a print that began disabled or
+in dry-run mode.
 
 After the print completes, is cancelled, or fails, the app runs the normal
 final reconciliation first and then captures final inventory. Expected usage is
@@ -149,8 +154,10 @@ when a new job starts.
 
 Audits are stored separately from `data/state.json` in the ignored runtime file
 `data/print_audits.json`. The latest 100 completed audits plus any active audit
-are retained using atomic writes. The **Print Audits** panel opens a detailed
-spool/evidence/event view and offers a **Download audit report** action. Exported
+are retained using atomic writes. The compact **Print Audits** panel initially
+shows recent rows and provides incremental controls for older audits and legacy
+records. It opens a detailed spool/evidence/event view and offers a
+**Download audit report** action. Exported
 JSON contains the frozen evidence, reasoning, warnings, and compact sync events;
 configured URLs and raw CFS payloads are excluded.
 

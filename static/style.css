@@ -505,7 +505,8 @@ button.audit-row:hover { background: var(--surface-3); border-color: var(--accen
 .audit-row-main strong { font-size: 13px; }
 .audit-row-main span { margin-top: 3px; font-size: 11px; color: var(--text-mute); }
 .audit-spool-count, .audit-usage { font-family: var(--font-mono); font-size: 11px; color: var(--text-dim); white-space: nowrap; }
-.audit-row-legacy { grid-template-columns: minmax(0, 1fr) auto auto; opacity: .82; }
+.audit-row-legacy { grid-template-columns: minmax(0, 1fr) auto auto auto; opacity: .82; }
+.audit-pager { display: flex; flex-wrap: wrap; justify-content: center; gap: 6px; padding-top: 4px; }
 
 .modal-panel-audit { width: min(1120px, calc(100% - 24px)); }
 .audit-modal-body { display: flex; flex-direction: column; gap: 12px; }
@@ -823,6 +824,7 @@ button.audit-row:hover { background: var(--surface-3); border-color: var(--accen
   .audit-row { grid-template-columns: minmax(0, 1fr) auto; }
   .audit-spool-count, .audit-usage { grid-column: 1 / -1; }
   .audit-row-legacy { grid-template-columns: minmax(0, 1fr) auto; }
+  .audit-row-legacy .chip { grid-column: 1 / -1; justify-self: start; }
   .audit-spool-list { grid-template-columns: 1fr; }
   .audit-detail-head { grid-template-columns: 1fr; align-items: start; }
   .audit-detail-head .status-chip { justify-self: start; }
