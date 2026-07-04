@@ -11,6 +11,7 @@ import subprocess
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -1008,6 +1009,7 @@ def _audit_configured(cfg: dict) -> bool:
 def _audit_sync_config(cfg: dict) -> dict:
     mappings = cfg.get("slot_mappings") if isinstance(cfg.get("slot_mappings"), dict) else {}
     return {
+        "url": str(cfg.get("url") or "").strip().rstrip("/"),
         "enabled": bool(cfg.get("enabled", False)),
         "dry_run": bool(cfg.get("dry_run", True)),
         "sync_mode": "live" if str(cfg.get("sync_mode") or "") == "live" else "post_print",
@@ -1083,6 +1085,26 @@ def _audit_snapshot_spool(spool_id: int, cfg: dict) -> dict:
         }
 
 
+def _audit_snapshot_spools(spool_ids: Any, cfg: dict) -> dict:
+    """Capture distinct spools concurrently so one unreachable server does not serialize timeouts."""
+    normalized_ids = set()
+    for spool_id in spool_ids or []:
+        try:
+            value = int(spool_id)
+        except Exception:
+            continue
+        if value > 0:
+            normalized_ids.add(value)
+    ids = sorted(normalized_ids)
+    if not ids:
+        return {}
+    if len(ids) == 1:
+        return {str(ids[0]): _audit_snapshot_spool(ids[0], cfg)}
+    with ThreadPoolExecutor(max_workers=min(8, len(ids)), thread_name_prefix="audit-snapshot") as executor:
+        futures = {spool_id: executor.submit(_audit_snapshot_spool, spool_id, cfg) for spool_id in ids}
+        return {str(spool_id): futures[spool_id].result() for spool_id in ids}
+
+
 def _audit_id(print_key: str) -> str:
     digest = hashlib.sha256(str(print_key).encode("utf-8", errors="replace")).hexdigest()[:20]
     return f"audit-{digest}"
@@ -1150,7 +1172,7 @@ def _audit_ensure_active(
         print_key = _stable_print_key(job_name, start_ts, 0.0, job_id=job_id)
         frozen = _audit_sync_config(cfg)
         spool_ids = sorted({int(v) for v in frozen["slot_mappings"].values() if v})
-        before = {str(spool_id): _audit_snapshot_spool(spool_id, cfg) for spool_id in spool_ids}
+        before = _audit_snapshot_spools(spool_ids, cfg)
         warnings = []
         if late_tracking:
             warnings.append("Tracking began after the print had already started; the initial inventory snapshot may be late.")
@@ -1189,8 +1211,17 @@ def _audit_cfg_for_print(state: AppState, cfg: dict, job_name: str, start_ts: fl
         return cfg, None
     frozen = active.get("config") if isinstance(active.get("config"), dict) else {}
     out = dict(cfg)
-    out.update({k: v for k, v in frozen.items() if k != "slot_mappings"})
+    frozen_url = str(frozen.get("url") or "").strip().rstrip("/")
+    out["url"] = frozen_url
+    for key in ("sync_mode", "live_min_delta_mm", "timeout_sec"):
+        if key in frozen:
+            out[key] = frozen[key]
     out["slot_mappings"] = dict(frozen.get("slot_mappings") or {})
+    # Current controls may only reduce write authority. A print that started
+    # disabled/dry-run cannot be armed mid-print, while either current safety
+    # control immediately stops real writes.
+    out["enabled"] = bool(frozen_url) and bool(frozen.get("enabled", False)) and bool(cfg.get("enabled", False))
+    out["dry_run"] = not bool(frozen_url) or bool(frozen.get("dry_run", True)) or bool(cfg.get("dry_run", True))
     return out, active
 
 
@@ -1285,6 +1316,8 @@ def _audit_finalize(
 
         frozen = audit.get("config") if isinstance(audit.get("config"), dict) else {}
         mappings = frozen.get("slot_mappings") if isinstance(frozen.get("slot_mappings"), dict) else {}
+        enabled = bool(frozen.get("enabled", False))
+        dry_run = bool(frozen.get("dry_run", True))
         slot_expected, parsed_total, cap_total = _capped_slot_usage(state, printer_total_mm)
         spool_expected: dict[str, float] = {}
         evidence_missing = bool(audit.get("late_tracking"))
@@ -1310,7 +1343,7 @@ def _audit_finalize(
         }
         before = audit.get("snapshots", {}).get("before", {}) if isinstance(audit.get("snapshots"), dict) else {}
         snapshot_ids = {int(k) for k in before.keys() if str(k).isdigit()} | event_spools | {int(k) for k in spool_expected.keys()}
-        after = {str(spool_id): _audit_snapshot_spool(spool_id, cfg) for spool_id in sorted(snapshot_ids)}
+        after = _audit_snapshot_spools(snapshot_ids, cfg)
 
         observed_spools = {}
         observed_total = 0.0
@@ -1321,6 +1354,7 @@ def _audit_finalize(
             b = before.get(key) if isinstance(before, dict) else None
             a = after.get(key)
             expected = float(spool_expected.get(key, 0.0) or 0.0)
+            inventory_expected = expected if enabled and not dry_run else 0.0
             observed = None
             if isinstance(b, dict) and isinstance(a, dict) and b.get("available") and a.get("available"):
                 before_used = _audit_number(b.get("used_length_mm"))
@@ -1332,12 +1366,13 @@ def _audit_finalize(
             if observed is None:
                 evidence_missing = True
                 warnings.append(f"Spool #{spool_id} lacks comparable before/after used_length evidence.")
-            elif abs(observed - expected) > 1.0:
-                discrepancies.append((spool_id, expected, observed))
+            elif abs(observed - inventory_expected) > 1.0:
+                discrepancies.append((spool_id, inventory_expected, observed))
             observed_spools[key] = {
                 "expected_mm": float(round(expected, 3)),
+                "expected_inventory_change_mm": float(round(inventory_expected, 3)),
                 "observed_mm": observed,
-                "difference_mm": (float(round(observed - expected, 3)) if observed is not None else None),
+                "difference_mm": (float(round(observed - inventory_expected, 3)) if observed is not None else None),
             }
 
         events = list(audit.get("events") or [])
@@ -1354,10 +1389,18 @@ def _audit_finalize(
                 evidence_missing = True
 
         total_expected = float(round(sum(slot_expected.values()), 3))
-        enabled = bool(frozen.get("enabled", False))
-        dry_run = bool(frozen.get("dry_run", True))
         normalized_result = str(result or "unknown").lower()
-        if total_expected <= 0.0:
+        if normalized_result in ("interrupted", "standby", "unknown"):
+            verdict = "inconclusive"
+            reasoning = "The print lifecycle did not provide a reliable completed, cancelled, or failed terminal state."
+        elif evidence_missing or comparable_count < len(snapshot_ids):
+            verdict = "inconclusive"
+            reasoning = "The available mappings or before/after used_length snapshots are insufficient to prove the final deduction."
+        elif discrepancies:
+            verdict = "needs_attention"
+            parts = [f"spool #{sid}: expected inventory change {expected:.3f} mm, observed {observed:.3f} mm" for sid, expected, observed in discrepancies]
+            reasoning = "Complete inventory evidence shows a missing or excess deduction (" + "; ".join(parts) + "). External inventory changes may contribute."
+        elif total_expected <= 0.0:
             verdict = "no_usage"
             reasoning = "Moonraker and the per-slot tracker reported no capped filament usage for this print."
         elif not enabled:
@@ -1366,16 +1409,6 @@ def _audit_finalize(
         elif dry_run:
             verdict = "dry_run"
             reasoning = "The print was audited in dry-run mode; no Spoolman deduction was requested."
-        elif normalized_result in ("interrupted", "standby", "unknown"):
-            verdict = "inconclusive"
-            reasoning = "The print lifecycle did not provide a reliable completed, cancelled, or failed terminal state."
-        elif evidence_missing or comparable_count < len(snapshot_ids):
-            verdict = "inconclusive"
-            reasoning = "The available mappings or before/after used_length snapshots are insufficient to prove the final deduction."
-        elif discrepancies:
-            verdict = "needs_attention"
-            parts = [f"spool #{sid}: expected {expected:.3f} mm, observed {observed:.3f} mm" for sid, expected, observed in discrepancies]
-            reasoning = "Complete inventory evidence shows a missing or excess deduction (" + "; ".join(parts) + "). External inventory changes may contribute."
         else:
             verdict = "verified"
             reasoning = "Every spool's used_length change matches the expected capped usage within 1 mm."
@@ -1439,7 +1472,7 @@ def _audit_refresh_after_retry(audit_id: str, cfg: dict) -> None:
             if isinstance(event, dict) and isinstance(event.get("spool_id"), int) and event.get("spool_id") > 0
         }
         spool_ids = {int(k) for k in before if str(k).isdigit()} | {int(k) for k in expected if str(k).isdigit()} | event_ids
-        after = {str(spool_id): _audit_snapshot_spool(spool_id, cfg) for spool_id in sorted(spool_ids)}
+        after = _audit_snapshot_spools(spool_ids, cfg)
         observed_spools = {}
         discrepancies = []
         missing = bool(audit.get("late_tracking"))
@@ -2639,7 +2672,8 @@ async def moonraker_poll_loop() -> None:
                         st.job_track_spoolman_live_seq = {}
                         st.job_track_spoolman_live_blocked = {}
                         try:
-                            _audit_ensure_active(
+                            await asyncio.to_thread(
+                                _audit_ensure_active,
                                 st,
                                 spoolman_cfg_now,
                                 filename,
@@ -2677,7 +2711,7 @@ async def moonraker_poll_loop() -> None:
                     st.job_track_last_state = ps_state
 
                     try:
-                        _plan_spoolman_live_sync_for_current_job(st)
+                        await asyncio.to_thread(_plan_spoolman_live_sync_for_current_job, st)
                     except Exception as e:
                         _set_spoolman_status(st, last_error=f"Live Spoolman sync failed: {e}")
 
@@ -2768,7 +2802,8 @@ async def moonraker_poll_loop() -> None:
                             continue
 
                     try:
-                        _plan_spoolman_sync_for_finished_job(
+                        await asyncio.to_thread(
+                            _plan_spoolman_sync_for_finished_job,
                             st,
                             st.job_track_name,
                             float(st.job_track_started_at or 0.0),
@@ -3297,6 +3332,11 @@ def api_ui_spoolman_retry(req: UiSpoolmanRetryRequest) -> ApiResponse:
     audit_id = str(retry_record.get("audit_id") or "").strip()
     audit = _find_audit(audit_id) if audit_id else None
     frozen = audit.get("config") if isinstance(audit, dict) and isinstance(audit.get("config"), dict) else {}
+    if isinstance(audit, dict):
+        frozen_url = str(frozen.get("url") or "").strip().rstrip("/")
+        if not frozen_url:
+            raise HTTPException(status_code=409, detail="This audit did not record its original Spoolman server; retry is blocked.")
+        cfg["url"] = frozen_url
     mappings = frozen.get("slot_mappings") if isinstance(frozen.get("slot_mappings"), dict) else cfg.get("slot_mappings")
     if not isinstance(mappings, dict):
         mappings = {}

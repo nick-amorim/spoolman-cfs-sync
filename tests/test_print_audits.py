@@ -1,4 +1,6 @@
 import json
+import threading
+import time
 
 import pytest
 
@@ -251,6 +253,147 @@ def test_mapping_changes_use_frozen_start_mapping(audit_env):
     assert calls == [(1, 60.0)]
     assert audit["verdict"] == "verified"
     assert any("Mappings changed" in warning for warning in audit["warnings"])
+
+
+def test_server_url_is_frozen_for_writes_and_final_snapshots(audit_env, monkeypatch):
+    state, cfg, inventory, calls = audit_env
+    seen_urls = []
+
+    def get_spool(spool_id, cfg=None):
+        seen_urls.append(("get", cfg["url"]))
+        return json.loads(json.dumps(inventory[int(spool_id)]))
+
+    def use_spool(spool_id, used_mm, cfg=None):
+        seen_urls.append(("use", cfg["url"]))
+        calls.append((int(spool_id), float(used_mm)))
+        inventory[int(spool_id)]["used_length"] += float(used_mm)
+        return {"id": int(spool_id)}
+
+    monkeypatch.setattr(appmod, "_spoolman_get_spool", get_spool)
+    monkeypatch.setattr(appmod, "_spoolman_use_spool", use_spool)
+    original_url = cfg["url"]
+    start_audit(state, cfg)
+    cfg["url"] = "http://different-spoolman.test:7912"
+    state.job_track_slot_mm = {"1A": 40.0}
+    state.job_track_printer_used_mm = 40.0
+
+    appmod._plan_spoolman_sync_for_finished_job(state, "part.gcode", 10, 20, "complete", "job-1", 40.0)
+
+    assert calls == [(1, 40.0)]
+    assert seen_urls
+    assert {url for _method, url in seen_urls} == {original_url}
+    assert completed_audit()["verdict"] == "verified"
+
+
+def test_active_audit_without_frozen_server_fails_closed(audit_env):
+    state, cfg, _inventory, _calls = audit_env
+    start_audit(state, cfg)
+    store = appmod.load_audits()
+    store["active"]["config"].pop("url")
+    appmod.save_audits(store)
+
+    effective, _audit = appmod._audit_cfg_for_print(state, cfg, "part.gcode", 10.0, "job-1")
+
+    assert effective["url"] == ""
+    assert effective["enabled"] is False
+    assert effective["dry_run"] is True
+
+
+@pytest.mark.parametrize("control", ["disable", "dry_run"])
+def test_current_safety_controls_stop_writes_mid_print(audit_env, control):
+    state, cfg, _inventory, calls = audit_env
+    start_audit(state, cfg)
+    if control == "disable":
+        cfg["enabled"] = False
+    else:
+        cfg["dry_run"] = True
+    state.job_track_slot_mm = {"1A": 50.0}
+    state.job_track_printer_used_mm = 50.0
+
+    appmod._plan_spoolman_sync_for_finished_job(state, "part.gcode", 10, 20, "complete", "job-1", 50.0)
+
+    assert calls == []
+    assert completed_audit()["verdict"] == "needs_attention"
+
+
+@pytest.mark.parametrize(
+    ("start_enabled", "start_dry_run", "expected_verdict"),
+    [(False, False, "sync_disabled"), (True, True, "dry_run")],
+)
+def test_current_settings_cannot_arm_a_print_that_started_safe(audit_env, start_enabled, start_dry_run, expected_verdict):
+    state, cfg, _inventory, calls = audit_env
+    cfg.update({"enabled": start_enabled, "dry_run": start_dry_run})
+    start_audit(state, cfg)
+    cfg.update({"enabled": True, "dry_run": False})
+    state.job_track_slot_mm = {"1A": 50.0}
+    state.job_track_printer_used_mm = 50.0
+
+    appmod._plan_spoolman_sync_for_finished_job(state, "part.gcode", 10, 20, "complete", "job-1", 50.0)
+
+    assert calls == []
+    assert completed_audit()["verdict"] == expected_verdict
+
+
+@pytest.mark.parametrize("mode", ["no_usage", "dry_run", "sync_disabled"])
+def test_unexpected_inventory_changes_override_informational_verdicts(audit_env, mode):
+    state, cfg, inventory, calls = audit_env
+    if mode == "dry_run":
+        cfg.update({"enabled": True, "dry_run": True})
+    elif mode == "sync_disabled":
+        cfg.update({"enabled": False, "dry_run": False})
+    start_audit(state, cfg)
+    inventory[1]["used_length"] += 25.0
+    if mode == "no_usage":
+        state.job_track_slot_mm = {}
+        state.job_track_printer_used_mm = 0.0
+    else:
+        state.job_track_slot_mm = {"1A": 50.0}
+        state.job_track_printer_used_mm = 50.0
+
+    appmod._plan_spoolman_sync_for_finished_job(
+        state,
+        "part.gcode",
+        10,
+        20,
+        "complete",
+        "job-1",
+        state.job_track_printer_used_mm,
+    )
+
+    assert calls == []
+    audit = completed_audit()
+    assert audit["verdict"] == "needs_attention"
+    assert audit["observed"]["spools"]["1"]["difference_mm"] == 25.0
+
+
+def test_mapped_spool_snapshots_run_concurrently(audit_env, monkeypatch):
+    state, cfg, inventory, _calls = audit_env
+    cfg["slot_mappings"].update({"1A": 1, "1B": 2, "1C": 3, "1D": 4})
+    inventory.update(
+        {
+            3: {"id": 3, "used_length": 0.0},
+            4: {"id": 4, "used_length": 0.0},
+        }
+    )
+    lock = threading.Lock()
+    active = 0
+    maximum = 0
+
+    def slow_get(spool_id, cfg=None):
+        nonlocal active, maximum
+        with lock:
+            active += 1
+            maximum = max(maximum, active)
+        time.sleep(0.03)
+        with lock:
+            active -= 1
+        return json.loads(json.dumps(inventory[int(spool_id)]))
+
+    monkeypatch.setattr(appmod, "_spoolman_get_spool", slow_get)
+    start_audit(state, cfg)
+
+    assert maximum > 1
+    assert len(appmod.load_audits()["active"]["snapshots"]["before"]) == 4
 
 
 def test_safe_retry_uses_frozen_mapping_and_refreshes_verdict(audit_env, monkeypatch):
