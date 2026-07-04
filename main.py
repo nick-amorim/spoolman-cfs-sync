@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import math
 import os
@@ -18,7 +19,7 @@ from urllib.request import Request as UrlRequest, urlopen
 from urllib.parse import quote, urlencode
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from models.schemas import (
@@ -76,8 +77,13 @@ STATIC_DIR = APP_DIR / "static"
 STATE_PATH = DATA_DIR / "state.json"
 PROFILES_PATH = DATA_DIR / "profiles.json"
 CONFIG_PATH = DATA_DIR / "config.json"
+AUDITS_PATH = DATA_DIR / "print_audits.json"
 MOONRAKER_POLL_TASK: Optional[asyncio.Task] = None
 APP_UPDATE_LOCK = threading.Lock()
+AUDIT_LOCK = threading.RLock()
+
+AUDIT_RETENTION = 100
+UI_SYNC_RECORD_LIMIT = 50
 
 DEFAULT_SLOTS = [
     "1A", "1B", "1C", "1D",
@@ -957,6 +963,552 @@ def _spoolman_use_spool(spool_id: int, used_mm: float, cfg: Optional[dict] = Non
     )
 
 
+# ---- Print audit persistence and evidence ----
+
+def _empty_audit_store() -> dict:
+    return {"version": 1, "active": None, "completed": []}
+
+
+def load_audits() -> dict:
+    with AUDIT_LOCK:
+        try:
+            raw = json.loads(AUDITS_PATH.read_text())
+        except FileNotFoundError:
+            return _empty_audit_store()
+        except Exception as e:
+            print(f"[AUDITS] load failed: {e}")
+            return _empty_audit_store()
+        if not isinstance(raw, dict):
+            return _empty_audit_store()
+        completed = raw.get("completed")
+        if not isinstance(completed, list):
+            completed = []
+        active = raw.get("active") if isinstance(raw.get("active"), dict) else None
+        return {"version": 1, "active": active, "completed": completed[:AUDIT_RETENTION]}
+
+
+def save_audits(store: dict) -> None:
+    with AUDIT_LOCK:
+        completed = store.get("completed") if isinstance(store, dict) else []
+        payload = {
+            "version": 1,
+            "active": store.get("active") if isinstance(store.get("active"), dict) else None,
+            "completed": list(completed if isinstance(completed, list) else [])[:AUDIT_RETENTION],
+        }
+        _write_json_atomic(AUDITS_PATH, payload)
+
+
+def _audit_configured(cfg: dict) -> bool:
+    mappings = cfg.get("slot_mappings") if isinstance(cfg.get("slot_mappings"), dict) else {}
+    return bool(str(cfg.get("url") or "").strip()) and any(
+        isinstance(v, int) and not isinstance(v, bool) and v > 0 for v in mappings.values()
+    )
+
+
+def _audit_sync_config(cfg: dict) -> dict:
+    mappings = cfg.get("slot_mappings") if isinstance(cfg.get("slot_mappings"), dict) else {}
+    return {
+        "enabled": bool(cfg.get("enabled", False)),
+        "dry_run": bool(cfg.get("dry_run", True)),
+        "sync_mode": "live" if str(cfg.get("sync_mode") or "") == "live" else "post_print",
+        "live_min_delta_mm": float(cfg.get("live_min_delta_mm", 100.0) or 100.0),
+        "timeout_sec": float(cfg.get("timeout_sec", 5.0) or 5.0),
+        "slot_mappings": {
+            sid: (int(value) if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None)
+            for sid, value in mappings.items()
+            if sid in DEFAULT_SLOTS
+        },
+    }
+
+
+def _audit_number(value: Any) -> Optional[float]:
+    try:
+        number = float(value)
+        return number if math.isfinite(number) else None
+    except Exception:
+        return None
+
+
+def _audit_first_number(data: dict, *keys: str) -> Optional[float]:
+    for key in keys:
+        if key in data:
+            value = _audit_number(data.get(key))
+            if value is not None:
+                return value
+    return None
+
+
+def _audit_spool_identity(spool: dict) -> dict:
+    filament = spool.get("filament") if isinstance(spool.get("filament"), dict) else {}
+    vendor = filament.get("vendor")
+    if isinstance(vendor, dict):
+        vendor = vendor.get("name") or vendor.get("title")
+    return {
+        "filament_id": filament.get("id") or spool.get("filament_id"),
+        "name": spool.get("filament_name") or spool.get("name") or filament.get("name") or filament.get("label") or "",
+        "material": spool.get("material") or filament.get("material") or "",
+        "vendor": vendor if isinstance(vendor, str) else (spool.get("vendor") or ""),
+        "color_hex": spool.get("color_hex") or spool.get("color") or filament.get("color_hex") or filament.get("color") or "",
+    }
+
+
+def _audit_snapshot_spool(spool_id: int, cfg: dict) -> dict:
+    captured_at = _now()
+    try:
+        spool = _spoolman_get_spool(int(spool_id), cfg)
+        if not isinstance(spool, dict):
+            raise ValueError("Spoolman returned a non-object spool response")
+        return {
+            "spool_id": int(spool_id),
+            "captured_at": captured_at,
+            "available": True,
+            "error": "",
+            "used_length_mm": _audit_first_number(spool, "used_length", "used_length_mm"),
+            "remaining_length_mm": _audit_first_number(spool, "remaining_length", "remaining_length_mm", "length_remaining"),
+            "used_weight_g": _audit_first_number(spool, "used_weight", "used_weight_g"),
+            "remaining_weight_g": _audit_first_number(spool, "remaining_weight", "remaining_weight_g", "weight_remaining"),
+            "filament": _audit_spool_identity(spool),
+        }
+    except Exception as e:
+        return {
+            "spool_id": int(spool_id),
+            "captured_at": captured_at,
+            "available": False,
+            "error": str(e),
+            "used_length_mm": None,
+            "remaining_length_mm": None,
+            "used_weight_g": None,
+            "remaining_weight_g": None,
+            "filament": {},
+        }
+
+
+def _audit_id(print_key: str) -> str:
+    digest = hashlib.sha256(str(print_key).encode("utf-8", errors="replace")).hexdigest()[:20]
+    return f"audit-{digest}"
+
+
+def _audit_matches(active: dict, job_name: str, start_ts: float, job_id: str) -> bool:
+    active_job_id = str(active.get("job_id") or "").strip()
+    if active_job_id and job_id:
+        return active_job_id == job_id
+    try:
+        same_start = abs(float(active.get("started_at") or 0.0) - float(start_ts or 0.0)) < 1.0
+    except Exception:
+        same_start = False
+    return same_start and str(active.get("filename") or "") == str(job_name or "")
+
+
+def _audit_complete_in_store(store: dict, audit: dict) -> None:
+    completed = [a for a in (store.get("completed") or []) if isinstance(a, dict) and a.get("audit_id") != audit.get("audit_id")]
+    completed.insert(0, audit)
+    store["completed"] = completed[:AUDIT_RETENTION]
+    store["active"] = None
+
+
+def _audit_interrupt_active(store: dict, reason: str) -> None:
+    active = store.get("active")
+    if not isinstance(active, dict):
+        return
+    active["status"] = "completed"
+    active["result"] = "interrupted"
+    active["completed_at"] = _now()
+    active["verdict"] = "inconclusive"
+    active["reasoning"] = "The print lifecycle was interrupted before final reconciliation and snapshots could complete."
+    warnings = list(active.get("warnings") or [])
+    if reason not in warnings:
+        warnings.append(reason)
+    active["warnings"] = warnings
+    _audit_complete_in_store(store, active)
+
+
+def _audit_ensure_active(
+    state: AppState,
+    cfg: dict,
+    job_name: str,
+    start_ts: float,
+    job_id: str = "",
+    *,
+    late_tracking: bool = False,
+) -> Optional[dict]:
+    if not _audit_configured(cfg) or not str(job_name or "").strip():
+        return None
+    late_tracking = bool(late_tracking or _job_track_total_mm(state) > 0)
+    with AUDIT_LOCK:
+        store = load_audits()
+        active = store.get("active")
+        if isinstance(active, dict) and _audit_matches(active, job_name, start_ts, job_id):
+            if job_id and not str(active.get("job_id") or "").strip():
+                active["job_id"] = job_id
+                active["print_key"] = _stable_print_key(job_name, start_ts, 0.0, job_id=job_id)
+                store["active"] = active
+                save_audits(store)
+            return active
+        if isinstance(active, dict):
+            _audit_interrupt_active(store, "A new print started before this audit could be finalized.")
+
+        print_key = _stable_print_key(job_name, start_ts, 0.0, job_id=job_id)
+        frozen = _audit_sync_config(cfg)
+        spool_ids = sorted({int(v) for v in frozen["slot_mappings"].values() if v})
+        before = {str(spool_id): _audit_snapshot_spool(spool_id, cfg) for spool_id in spool_ids}
+        warnings = []
+        if late_tracking:
+            warnings.append("Tracking began after the print had already started; the initial inventory snapshot may be late.")
+        for snapshot in before.values():
+            if not snapshot.get("available"):
+                warnings.append(f"Starting snapshot for spool #{snapshot.get('spool_id')} was unavailable: {snapshot.get('error')}")
+            elif snapshot.get("used_length_mm") is None:
+                warnings.append(f"Starting snapshot for spool #{snapshot.get('spool_id')} has no used_length field.")
+        audit = {
+            "audit_id": _audit_id(print_key),
+            "print_key": print_key,
+            "job_id": str(job_id or ""),
+            "filename": str(job_name),
+            "started_at": float(start_ts or _now()),
+            "completed_at": None,
+            "result": "printing",
+            "status": "active",
+            "verdict": "in_progress",
+            "reasoning": "The print is active; final reconciliation and inventory evidence are pending.",
+            "config": frozen,
+            "snapshots": {"before": before, "after": {}},
+            "expected": {"slots": {}, "spools": {}, "total_mm": 0.0, "moonraker_cap_mm": 0.0},
+            "observed": {"spools": {}, "total_mm": None},
+            "events": [],
+            "warnings": warnings,
+            "late_tracking": bool(late_tracking),
+        }
+        store["active"] = audit
+        save_audits(store)
+        return audit
+
+
+def _audit_cfg_for_print(state: AppState, cfg: dict, job_name: str, start_ts: float, job_id: str = "") -> tuple[dict, Optional[dict]]:
+    active = _audit_ensure_active(state, cfg, job_name, start_ts, job_id, late_tracking=False)
+    if not isinstance(active, dict):
+        return cfg, None
+    frozen = active.get("config") if isinstance(active.get("config"), dict) else {}
+    out = dict(cfg)
+    out.update({k: v for k, v in frozen.items() if k != "slot_mappings"})
+    out["slot_mappings"] = dict(frozen.get("slot_mappings") or {})
+    return out, active
+
+
+def _audit_compact_response(value: Any) -> Any:
+    if isinstance(value, dict):
+        allowed = ("id", "used_length", "remaining_length", "used_weight", "remaining_weight", "message", "detail")
+        return {k: _audit_compact_response(value[k]) for k in allowed if k in value}
+    if isinstance(value, list):
+        return [_audit_compact_response(v) for v in value[:10]]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def _audit_record_event(key: str, record: dict) -> None:
+    audit_id = str(record.get("audit_id") or "").strip()
+    if not audit_id:
+        return
+    with AUDIT_LOCK:
+        store = load_audits()
+        target = store.get("active")
+        location = "active"
+        if not isinstance(target, dict) or target.get("audit_id") != audit_id:
+            target = next((a for a in store.get("completed", []) if isinstance(a, dict) and a.get("audit_id") == audit_id), None)
+            location = "completed"
+        if not isinstance(target, dict):
+            return
+        event = {
+            "record_key": key,
+            "at": float(record.get("updated_at") or _now()),
+            "phase": str(record.get("sync_phase") or "post_print"),
+            "slot": str(record.get("slot") or ""),
+            "spool_id": record.get("spool_id"),
+            "used_mm": float(record.get("used_mm") or 0.0),
+            "status": str(record.get("status") or ""),
+            "attempts": int(record.get("attempts") or 0),
+            "error": str(record.get("error") or ""),
+        }
+        if "spoolman_response" in record:
+            event["spoolman_response"] = _audit_compact_response(record.get("spoolman_response"))
+        if "spoolman_validation" in record:
+            event["spoolman_validation"] = _audit_compact_response(record.get("spoolman_validation"))
+        events = list(target.get("events") or [])
+        if events and events[-1] == event:
+            return
+        events.append(event)
+        target["events"] = events
+        if location == "active":
+            store["active"] = target
+        save_audits(store)
+
+
+def _capped_slot_usage(state: AppState, printer_total_mm: Optional[float] = None) -> tuple[dict, float, float]:
+    slot_mm = getattr(state, "job_track_slot_mm", {}) if isinstance(getattr(state, "job_track_slot_mm", {}), dict) else {}
+    parsed_total = sum(max(0.0, float(v or 0.0)) for v in slot_mm.values())
+    try:
+        printer_total = float(printer_total_mm if printer_total_mm is not None else getattr(state, "job_track_printer_used_mm", 0.0) or 0.0)
+    except Exception:
+        printer_total = 0.0
+    scale = 1.0
+    if parsed_total > 0 and printer_total > 0 and parsed_total > printer_total:
+        scale = max(0.0, min(1.0, printer_total / parsed_total))
+    capped = {}
+    for sid, value in slot_mm.items():
+        try:
+            amount = max(0.0, float(value or 0.0) * scale)
+        except Exception:
+            amount = 0.0
+        if amount > 0 and str(sid).upper() in DEFAULT_SLOTS:
+            capped[str(sid).upper()] = float(round(amount, 3))
+    return capped, float(round(parsed_total, 3)), float(round(max(0.0, printer_total), 3))
+
+
+def _audit_finalize(
+    state: AppState,
+    cfg: dict,
+    job_name: str,
+    start_ts: float,
+    end_ts: float,
+    result: str,
+    job_id: str = "",
+    printer_total_mm: Optional[float] = None,
+) -> Optional[dict]:
+    with AUDIT_LOCK:
+        store = load_audits()
+        audit = store.get("active")
+        if not isinstance(audit, dict) or not _audit_matches(audit, job_name, start_ts, job_id):
+            audit = _audit_ensure_active(state, cfg, job_name, start_ts, job_id, late_tracking=True)
+            store = load_audits()
+        if not isinstance(audit, dict):
+            return None
+
+        frozen = audit.get("config") if isinstance(audit.get("config"), dict) else {}
+        mappings = frozen.get("slot_mappings") if isinstance(frozen.get("slot_mappings"), dict) else {}
+        slot_expected, parsed_total, cap_total = _capped_slot_usage(state, printer_total_mm)
+        spool_expected: dict[str, float] = {}
+        evidence_missing = bool(audit.get("late_tracking"))
+        warnings = list(audit.get("warnings") or [])
+        for sid, amount in slot_expected.items():
+            spool_id = mappings.get(sid)
+            if not spool_id:
+                evidence_missing = True
+                warnings.append(f"CFS slot {sid} used {amount:.3f} mm but had no frozen Spoolman mapping.")
+                continue
+            key = str(int(spool_id))
+            spool_expected[key] = spool_expected.get(key, 0.0) + amount
+
+        current_cfg = _normalize_spoolman_config(load_config())
+        current_mappings = current_cfg.get("slot_mappings") if isinstance(current_cfg.get("slot_mappings"), dict) else {}
+        changed_slots = [sid for sid in DEFAULT_SLOTS if current_mappings.get(sid) != mappings.get(sid)]
+        if changed_slots:
+            warnings.append("Mappings changed during the print; reconciliation used the frozen mappings for: " + ", ".join(changed_slots))
+
+        event_spools = {
+            int(e.get("spool_id")) for e in audit.get("events", [])
+            if isinstance(e, dict) and isinstance(e.get("spool_id"), int) and e.get("spool_id") > 0
+        }
+        before = audit.get("snapshots", {}).get("before", {}) if isinstance(audit.get("snapshots"), dict) else {}
+        snapshot_ids = {int(k) for k in before.keys() if str(k).isdigit()} | event_spools | {int(k) for k in spool_expected.keys()}
+        after = {str(spool_id): _audit_snapshot_spool(spool_id, cfg) for spool_id in sorted(snapshot_ids)}
+
+        observed_spools = {}
+        observed_total = 0.0
+        comparable_count = 0
+        discrepancies = []
+        for spool_id in sorted(snapshot_ids):
+            key = str(spool_id)
+            b = before.get(key) if isinstance(before, dict) else None
+            a = after.get(key)
+            expected = float(spool_expected.get(key, 0.0) or 0.0)
+            observed = None
+            if isinstance(b, dict) and isinstance(a, dict) and b.get("available") and a.get("available"):
+                before_used = _audit_number(b.get("used_length_mm"))
+                after_used = _audit_number(a.get("used_length_mm"))
+                if before_used is not None and after_used is not None:
+                    observed = float(round(after_used - before_used, 3))
+                    observed_total += observed
+                    comparable_count += 1
+            if observed is None:
+                evidence_missing = True
+                warnings.append(f"Spool #{spool_id} lacks comparable before/after used_length evidence.")
+            elif abs(observed - expected) > 1.0:
+                discrepancies.append((spool_id, expected, observed))
+            observed_spools[key] = {
+                "expected_mm": float(round(expected, 3)),
+                "observed_mm": observed,
+                "difference_mm": (float(round(observed - expected, 3)) if observed is not None else None),
+            }
+
+        events = list(audit.get("events") or [])
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            status = str(event.get("status") or "")
+            if status in ("timeout_uncertain", "conflict", "failed", "skipped_invalid_spool", "skipped_unmapped"):
+                warning = f"{event.get('phase')} record for slot {event.get('slot')} ended as {status}."
+                if event.get("error"):
+                    warning += " " + str(event.get("error"))
+                warnings.append(warning)
+            if status == "skipped_invalid_spool":
+                evidence_missing = True
+
+        total_expected = float(round(sum(slot_expected.values()), 3))
+        enabled = bool(frozen.get("enabled", False))
+        dry_run = bool(frozen.get("dry_run", True))
+        normalized_result = str(result or "unknown").lower()
+        if total_expected <= 0.0:
+            verdict = "no_usage"
+            reasoning = "Moonraker and the per-slot tracker reported no capped filament usage for this print."
+        elif not enabled:
+            verdict = "sync_disabled"
+            reasoning = "Spoolman writes were disabled in the configuration frozen at print start."
+        elif dry_run:
+            verdict = "dry_run"
+            reasoning = "The print was audited in dry-run mode; no Spoolman deduction was requested."
+        elif normalized_result in ("interrupted", "standby", "unknown"):
+            verdict = "inconclusive"
+            reasoning = "The print lifecycle did not provide a reliable completed, cancelled, or failed terminal state."
+        elif evidence_missing or comparable_count < len(snapshot_ids):
+            verdict = "inconclusive"
+            reasoning = "The available mappings or before/after used_length snapshots are insufficient to prove the final deduction."
+        elif discrepancies:
+            verdict = "needs_attention"
+            parts = [f"spool #{sid}: expected {expected:.3f} mm, observed {observed:.3f} mm" for sid, expected, observed in discrepancies]
+            reasoning = "Complete inventory evidence shows a missing or excess deduction (" + "; ".join(parts) + "). External inventory changes may contribute."
+        else:
+            verdict = "verified"
+            reasoning = "Every spool's used_length change matches the expected capped usage within 1 mm."
+
+        audit["completed_at"] = float(end_ts or _now())
+        audit["result"] = normalized_result
+        audit["status"] = "completed"
+        audit["verdict"] = verdict
+        audit["reasoning"] = reasoning
+        audit["warnings"] = list(dict.fromkeys(warnings))
+        audit["snapshots"] = {"before": before, "after": after}
+        audit["expected"] = {
+            "slots": slot_expected,
+            "spools": {k: float(round(v, 3)) for k, v in spool_expected.items()},
+            "total_mm": total_expected,
+            "parsed_total_mm": parsed_total,
+            "moonraker_cap_mm": cap_total,
+        }
+        audit["observed"] = {
+            "spools": observed_spools,
+            "total_mm": (float(round(observed_total, 3)) if comparable_count else None),
+        }
+        _audit_complete_in_store(store, audit)
+        save_audits(store)
+        return audit
+
+
+def _audit_summary(audit: dict) -> dict:
+    before = audit.get("snapshots", {}).get("before", {}) if isinstance(audit.get("snapshots"), dict) else {}
+    expected = audit.get("expected") if isinstance(audit.get("expected"), dict) else {}
+    observed = audit.get("observed") if isinstance(audit.get("observed"), dict) else {}
+    return {
+        "audit_id": audit.get("audit_id"),
+        "filename": audit.get("filename"),
+        "result": audit.get("result"),
+        "started_at": audit.get("started_at"),
+        "completed_at": audit.get("completed_at"),
+        "spool_count": len(before),
+        "expected_mm": expected.get("total_mm", 0.0),
+        "observed_mm": observed.get("total_mm"),
+        "verdict": audit.get("verdict", "in_progress"),
+        "warning_count": len(audit.get("warnings") or []),
+    }
+
+
+def _audit_refresh_after_retry(audit_id: str, cfg: dict) -> None:
+    """Refresh completed inventory evidence after an explicitly requested safe retry."""
+    with AUDIT_LOCK:
+        store = load_audits()
+        audit = next(
+            (a for a in store.get("completed", []) if isinstance(a, dict) and a.get("audit_id") == audit_id),
+            None,
+        )
+        if not isinstance(audit, dict):
+            return
+        snapshots = audit.get("snapshots") if isinstance(audit.get("snapshots"), dict) else {}
+        before = snapshots.get("before") if isinstance(snapshots.get("before"), dict) else {}
+        expected = audit.get("expected", {}).get("spools", {}) if isinstance(audit.get("expected"), dict) else {}
+        event_ids = {
+            int(event.get("spool_id")) for event in audit.get("events", [])
+            if isinstance(event, dict) and isinstance(event.get("spool_id"), int) and event.get("spool_id") > 0
+        }
+        spool_ids = {int(k) for k in before if str(k).isdigit()} | {int(k) for k in expected if str(k).isdigit()} | event_ids
+        after = {str(spool_id): _audit_snapshot_spool(spool_id, cfg) for spool_id in sorted(spool_ids)}
+        observed_spools = {}
+        discrepancies = []
+        missing = bool(audit.get("late_tracking"))
+        total_observed = 0.0
+        compared = 0
+        for spool_id in sorted(spool_ids):
+            key = str(spool_id)
+            b = before.get(key)
+            a = after.get(key)
+            expected_mm = float(expected.get(key, 0.0) or 0.0)
+            observed_mm = None
+            if isinstance(b, dict) and isinstance(a, dict) and b.get("available") and a.get("available"):
+                b_used = _audit_number(b.get("used_length_mm"))
+                a_used = _audit_number(a.get("used_length_mm"))
+                if b_used is not None and a_used is not None:
+                    observed_mm = float(round(a_used - b_used, 3))
+            if observed_mm is None:
+                missing = True
+            else:
+                compared += 1
+                total_observed += observed_mm
+                if abs(observed_mm - expected_mm) > 1.0:
+                    discrepancies.append((spool_id, expected_mm, observed_mm))
+            observed_spools[key] = {
+                "expected_mm": expected_mm,
+                "observed_mm": observed_mm,
+                "difference_mm": (float(round(observed_mm - expected_mm, 3)) if observed_mm is not None else None),
+            }
+        if float(audit.get("expected", {}).get("total_mm", 0.0) or 0.0) <= 0:
+            verdict = "no_usage"
+            reasoning = "Moonraker and the per-slot tracker reported no capped filament usage for this print."
+        elif missing or compared < len(spool_ids):
+            verdict = "inconclusive"
+            reasoning = "The safe retry completed, but before/after used_length evidence is still insufficient."
+        elif discrepancies:
+            verdict = "needs_attention"
+            reasoning = "Inventory evidence after the safe retry still shows a missing or excess deduction."
+        else:
+            verdict = "verified"
+            reasoning = "Inventory evidence after the safe retry matches expected capped usage within 1 mm."
+        audit["snapshots"] = {"before": before, "after": after}
+        audit["observed"] = {
+            "spools": observed_spools,
+            "total_mm": (float(round(total_observed, 3)) if compared else None),
+        }
+        audit["verdict"] = verdict
+        audit["reasoning"] = reasoning
+        warnings = list(audit.get("warnings") or [])
+        warnings.append("Final inventory evidence was refreshed after a user-requested safe retry.")
+        audit["warnings"] = list(dict.fromkeys(warnings))
+        save_audits(store)
+
+
+def _find_audit(audit_id: str) -> Optional[dict]:
+    store = load_audits()
+    active = store.get("active")
+    if isinstance(active, dict) and active.get("audit_id") == audit_id:
+        return active
+    return next((a for a in store.get("completed", []) if isinstance(a, dict) and a.get("audit_id") == audit_id), None)
+
+
+def _audit_preserve_interrupted(reason: str) -> None:
+    with AUDIT_LOCK:
+        store = load_audits()
+        if isinstance(store.get("active"), dict):
+            _audit_interrupt_active(store, reason)
+            save_audits(store)
+
+
 def _set_spoolman_status(state: AppState, **updates) -> None:
     status = dict(getattr(state, "spoolman_status", {}) or {})
     merged = _default_spoolman_status()
@@ -1025,6 +1577,7 @@ def _save_spoolman_record(state: AppState, key: str, record: dict) -> None:
     records[key] = record
     state.spoolman_sync_records = records
     save_state(state)
+    _audit_record_event(key, record)
 
 
 def _spoolman_sync_record(state: AppState, key: str, record: dict, cfg: dict) -> dict:
@@ -1069,7 +1622,8 @@ def _spoolman_sync_record(state: AppState, key: str, record: dict, cfg: dict) ->
     _save_spoolman_record(state, key, record)
 
     try:
-        _spoolman_get_spool(int(spool_id), cfg)
+        validation_response = _spoolman_get_spool(int(spool_id), cfg)
+        record["spoolman_validation"] = _audit_compact_response(validation_response)
         _set_spoolman_status(state, connected=True, last_check_at=_now(), last_error="")
     except SpoolmanHttpError as e:
         if e.status_code == 404:
@@ -1089,7 +1643,8 @@ def _spoolman_sync_record(state: AppState, key: str, record: dict, cfg: dict) ->
         return record
 
     try:
-        _spoolman_use_spool(int(spool_id), float(record.get("used_mm") or 0.0), cfg)
+        response = _spoolman_use_spool(int(spool_id), float(record.get("used_mm") or 0.0), cfg)
+        record["spoolman_response"] = _audit_compact_response(response)
         record["status"] = "synced"
         record["synced_at"] = _now()
         record["error"] = ""
@@ -1168,16 +1723,16 @@ def _has_blocking_live_spoolman_record(state: AppState, job_key: str, slot_id: s
 
 def _plan_spoolman_live_sync_for_current_job(state: AppState) -> None:
     cfg = _normalize_spoolman_config(load_config())
-    if str(cfg.get("sync_mode") or "") != "live":
-        return
-    if not (bool(cfg.get("dry_run", True)) or bool(cfg.get("enabled", False))):
-        return
-
     job_name = str(getattr(state, "job_track_name", "") or "").strip()
     if not job_name:
         return
     start_ts = float(getattr(state, "job_track_started_at", 0.0) or 0.0)
     job_id = str(getattr(state, "job_track_id", "") or "").strip()
+    cfg, audit = _audit_cfg_for_print(state, cfg, job_name, start_ts, job_id)
+    if str(cfg.get("sync_mode") or "") != "live":
+        return
+    if not (bool(cfg.get("dry_run", True)) or bool(cfg.get("enabled", False))):
+        return
     job_key = _live_spoolman_print_key(job_name, start_ts, job_id=job_id)
 
     slot_mm = getattr(state, "job_track_slot_mm", {}) if isinstance(getattr(state, "job_track_slot_mm", {}), dict) else {}
@@ -1229,6 +1784,8 @@ def _plan_spoolman_live_sync_for_current_job(state: AppState) -> None:
         )
         record["sync_phase"] = "live"
         record["total_mm_after"] = float(round(total_mm, 3))
+        if isinstance(audit, dict):
+            record["audit_id"] = audit.get("audit_id")
         key = _spoolman_record_key_phase(job_key, sid_s, f"live:{seq}")
 
         rec = _spoolman_sync_record(state, key, record, cfg)
@@ -1264,7 +1821,9 @@ def _plan_spoolman_sync_for_finished_job(
     printer_total_mm: Optional[float] = None,
 ) -> None:
     cfg = _normalize_spoolman_config(load_config())
+    cfg, audit = _audit_cfg_for_print(state, cfg, job_name, start_ts, str(job_id or ""))
     if not (bool(cfg.get("dry_run", True)) or bool(cfg.get("enabled", False))):
+        _audit_finalize(state, cfg, job_name, start_ts, end_ts, result, str(job_id or ""), printer_total_mm)
         return
 
     slot_mm = getattr(state, "job_track_slot_mm", {}) if isinstance(getattr(state, "job_track_slot_mm", {}), dict) else {}
@@ -1274,21 +1833,10 @@ def _plan_spoolman_sync_for_finished_job(
     live_mode = str(cfg.get("sync_mode") or "") == "live"
     live_job_key = _live_spoolman_print_key(job_name, start_ts, job_id=job_id)
     live_synced, _, _, live_blocked = _live_spoolman_maps(state)
-    scale = 1.0
-    try:
-        parsed_total_mm = sum(max(0.0, float(v or 0.0)) for v in slot_mm.values())
-        printer_total = float(printer_total_mm or 0.0)
-        if printer_total > 0 and parsed_total_mm > printer_total:
-            scale = max(0.0, min(1.0, printer_total / parsed_total_mm))
-    except Exception:
-        scale = 1.0
+    capped_slots, _, _ = _capped_slot_usage(state, printer_total_mm)
 
-    for sid, mm_val in slot_mm.items():
+    for sid, total_mm in capped_slots.items():
         sid_s = str(sid).strip().upper()
-        try:
-            total_mm = float(mm_val or 0.0) * scale
-        except Exception:
-            total_mm = 0.0
         if total_mm <= 0:
             continue
 
@@ -1312,6 +1860,8 @@ def _plan_spoolman_sync_for_finished_job(
                     error="Live Spoolman sync for this slot has an uncertain record. Verify Spoolman inventory before final reconciliation.",
                 )
                 record["sync_phase"] = "final"
+                if isinstance(audit, dict):
+                    record["audit_id"] = audit.get("audit_id")
                 _save_spoolman_record(state, _spoolman_record_key_phase(job_key, sid_s, "final"), record)
                 continue
             try:
@@ -1335,8 +1885,12 @@ def _plan_spoolman_sync_for_finished_job(
             result=result,
         )
         record["sync_phase"] = "final" if live_mode else "post_print"
+        if isinstance(audit, dict):
+            record["audit_id"] = audit.get("audit_id")
         key = _spoolman_record_key_phase(job_key, sid_s, "final") if live_mode else _spoolman_record_key(job_key, sid_s)
         _spoolman_sync_record(state, key, record, cfg)
+
+    _audit_finalize(state, cfg, job_name, start_ts, end_ts, result, str(job_id or ""), printer_total_mm)
 
 
 def _update_spoolman_config(update: dict) -> dict:
@@ -2052,7 +2606,19 @@ async def moonraker_poll_loop() -> None:
 
                 # Start tracking when a print begins
                 if is_printing and filename:
-                    if (not tracking) or (st.job_track_name != filename):
+                    tracked_job_id = str(getattr(st, "job_track_id", "") or "").strip()
+                    new_instance = bool(
+                        tracking
+                        and (
+                            st.job_track_name != filename
+                            or (job_id and tracked_job_id and job_id != tracked_job_id)
+                        )
+                    )
+                    if (not tracking) or new_instance:
+                        if new_instance:
+                            _audit_preserve_interrupted(
+                                "Moonraker started a new print instance before the previous lifecycle was finalized."
+                            )
                         st.job_track_name = filename
                         st.job_track_id = job_id
                         st.job_track_started_at = _now()
@@ -2072,6 +2638,17 @@ async def moonraker_poll_loop() -> None:
                         st.job_track_spoolman_live_last_attempt_mm = {}
                         st.job_track_spoolman_live_seq = {}
                         st.job_track_spoolman_live_blocked = {}
+                        try:
+                            _audit_ensure_active(
+                                st,
+                                spoolman_cfg_now,
+                                filename,
+                                float(st.job_track_started_at),
+                                job_id,
+                                late_tracking=False,
+                            )
+                        except Exception as e:
+                            _set_spoolman_status(st, last_error=f"Print audit start failed: {e}")
                     elif job_id and not str(getattr(st, "job_track_id", "") or "").strip():
                         st.job_track_id = job_id
 
@@ -2441,7 +3018,13 @@ def _ui_state_dict(state: AppState) -> dict:
     d.setdefault("cfs_slots", {})
     d.setdefault("cfs_raw", {})
     d.setdefault("spoolman_status", _default_spoolman_status())
-    d.setdefault("spoolman_sync_records", {})
+    records = d.get("spoolman_sync_records") if isinstance(d.get("spoolman_sync_records"), dict) else {}
+    recent_records = sorted(
+        records.items(),
+        key=lambda item: float(item[1].get("updated_at") or item[1].get("created_at") or 0.0) if isinstance(item[1], dict) else 0.0,
+        reverse=True,
+    )[:UI_SYNC_RECORD_LIMIT]
+    d["spoolman_sync_records"] = dict(recent_records)
     d["printer_config"] = _printer_public_config()
     d["spoolman_config"] = _spoolman_public_config()
 
@@ -2500,6 +3083,7 @@ def _clear_local_accounting(state: AppState) -> AppState:
             continue
 
     save_state(state)
+    save_audits(_empty_audit_store())
     return state
 
 
@@ -2531,6 +3115,65 @@ def api_ui_update_apply() -> ApiResponse:
 @app.get("/api/ui/state", response_model=ApiResponse)
 def api_ui_state() -> ApiResponse:
     return ApiResponse(result=_ui_state_dict(load_state()))
+
+
+@app.get("/api/ui/audits", response_model=ApiResponse)
+def api_ui_audits() -> ApiResponse:
+    store = load_audits()
+    audits = []
+    if isinstance(store.get("active"), dict):
+        audits.append(_audit_summary(store["active"]))
+    audits.extend(_audit_summary(a) for a in store.get("completed", []) if isinstance(a, dict))
+    records = load_state().spoolman_sync_records or {}
+    legacy = [
+        {"record_key": key, **record}
+        for key, record in sorted(
+            ((k, v) for k, v in records.items() if isinstance(v, dict) and not v.get("audit_id")),
+            key=lambda item: float(item[1].get("updated_at") or item[1].get("created_at") or 0.0),
+            reverse=True,
+        )[:UI_SYNC_RECORD_LIMIT]
+    ]
+    return ApiResponse(result={"audits": audits, "legacy_records": legacy, "retention": AUDIT_RETENTION})
+
+
+@app.get("/api/ui/audits/{audit_id}", response_model=ApiResponse)
+def api_ui_audit_detail(audit_id: str) -> ApiResponse:
+    audit = _find_audit(str(audit_id or "").strip())
+    if not isinstance(audit, dict):
+        raise HTTPException(status_code=404, detail="Unknown print audit")
+    return ApiResponse(result={"audit": audit})
+
+
+def _sanitized_audit_export(value: Any) -> Any:
+    if isinstance(value, dict):
+        blocked = {"url", "spoolman_url", "moonraker_url", "cfs_raw", "raw_cfs_payload"}
+        return {str(k): _sanitized_audit_export(v) for k, v in value.items() if str(k).lower() not in blocked}
+    if isinstance(value, list):
+        return [_sanitized_audit_export(v) for v in value]
+    if isinstance(value, str):
+        return re.sub(r"https?://[^\s\"'<>]+", "[redacted-url]", value, flags=re.IGNORECASE)
+    if isinstance(value, (int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+@app.get("/api/ui/audits/{audit_id}/export")
+def api_ui_audit_export(audit_id: str):
+    audit = _find_audit(str(audit_id or "").strip())
+    if not isinstance(audit, dict):
+        raise HTTPException(status_code=404, detail="Unknown print audit")
+    payload = _sanitized_audit_export(
+        {
+            "schema": "spoolman-cfs-sync.print-audit.v1",
+            "exported_at": _now(),
+            "audit": audit,
+        }
+    )
+    safe_id = re.sub(r"[^A-Za-z0-9._-]+", "-", str(audit_id))
+    return JSONResponse(
+        content=payload,
+        headers={"Content-Disposition": f'attachment; filename="print-audit-{safe_id}.json"'},
+    )
 
 
 @app.post("/api/ui/printer/config", response_model=ApiResponse)
@@ -2651,10 +3294,17 @@ def api_ui_spoolman_retry(req: UiSpoolmanRetryRequest) -> ApiResponse:
     cfg = _normalize_spoolman_config(load_config())
     retry_record = dict(rec)
     sid = str(retry_record.get("slot") or "").strip().upper()
-    mappings = cfg.get("slot_mappings") if isinstance(cfg.get("slot_mappings"), dict) else {}
+    audit_id = str(retry_record.get("audit_id") or "").strip()
+    audit = _find_audit(audit_id) if audit_id else None
+    frozen = audit.get("config") if isinstance(audit, dict) and isinstance(audit.get("config"), dict) else {}
+    mappings = frozen.get("slot_mappings") if isinstance(frozen.get("slot_mappings"), dict) else cfg.get("slot_mappings")
+    if not isinstance(mappings, dict):
+        mappings = {}
     if sid in mappings:
         retry_record["spool_id"] = mappings.get(sid)
     _spoolman_sync_record(st, key, retry_record, cfg)
+    if audit_id:
+        _audit_refresh_after_retry(audit_id, cfg)
     return ApiResponse(result=_ui_state_dict(load_state()))
 
 
