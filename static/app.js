@@ -3,6 +3,8 @@
  * All fetch endpoints, payload shapes and state fields are unchanged.
  * Endpoints used:
  *   GET  /api/ui/state
+ *   GET  /api/ui/audits
+ *   GET  /api/ui/audits/{audit_id}
  *   GET  /api/ui/spoolman/spools
  *   POST /api/ui/spool/set_start            { slot, start_g }
  *   POST /api/ui/spool/set_remaining        { slot, remaining_g }
@@ -20,6 +22,7 @@ const $ = (id) => document.getElementById(id);
 const DEBUG_MODE_KEY = "spoolmanCfsSyncDebugMode";
 
 let latestState = null;
+let latestAuditPayload = { audits: [], legacy_records: [] };
 let spoolmanSpools = [];
 let spoolmanSpoolsLoadingPromise = null;
 let spoolmanSpoolsLoadedAt = 0;
@@ -602,6 +605,7 @@ function initModalCloses() {
       if (key === "spool")    closeSpoolModal();
       if (key === "picker")   closeSpoolmanPicker();
       if (key === "settings") closeSettingsModal();
+      if (key === "audit")    closeAuditModal();
     });
   });
   $("spoolClose")?.addEventListener?.("click", closeSpoolModal);
@@ -649,9 +653,9 @@ const SYNC_DEFAULT = 6;
 const SYNC_HARD_MAX = 50;
 let syncExpanded = false;
 
-function renderSyncRecords(state) {
-  const wrap = $("syncList");
-  const meta = $("syncMeta");
+function renderLegacySyncRecords(state) {
+  const wrap = $("auditList");
+  const meta = $("auditMeta");
   if (!wrap) return;
   wrap.innerHTML = "";
   const cfg = state.spoolman_config || {};
@@ -729,6 +733,188 @@ function renderSyncRecords(state) {
         if (latestState) render(latestState);
       } },
     }));
+  }
+}
+
+/* ---------- print audits ---------- */
+
+function auditVerdictKind(verdict) {
+  const value = String(verdict || "inconclusive");
+  if (value === "verified" || value === "no_usage") return { key: "synced", label: value.replace("_", " ") };
+  if (value === "in_progress") return { key: "pending", label: "in progress" };
+  if (value === "dry_run") return { key: "dry_run", label: "dry-run" };
+  if (value === "sync_disabled") return { key: "skipped", label: "sync disabled" };
+  if (value === "needs_attention") return { key: "failed", label: "needs attention" };
+  return { key: "timeout", label: "inconclusive" };
+}
+
+function fmtDateTime(ts) {
+  const value = Number(ts || 0);
+  return value > 0 ? new Date(value * 1000).toLocaleString() : "now";
+}
+
+function auditMetric(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? fmtMm(number) : "—";
+}
+
+function closeAuditModal() {
+  const modal = $("auditModal");
+  if (modal) modal.hidden = true;
+}
+
+async function retryAuditRecord(recordKey, auditId) {
+  await postJson("/api/ui/spoolman/retry", { record_key: recordKey });
+  await tick();
+  await openAuditModal(auditId);
+}
+
+function auditSnapshotValue(snapshot, key, formatter) {
+  if (!snapshot || snapshot.available !== true) return "unavailable";
+  const value = Number(snapshot[key]);
+  return Number.isFinite(value) ? formatter(value) : "—";
+}
+
+function renderAuditSpools(audit) {
+  const snapshots = audit.snapshots || {};
+  const before = snapshots.before || {};
+  const after = snapshots.after || {};
+  const observed = (audit.observed || {}).spools || {};
+  const mappings = (audit.config || {}).slot_mappings || {};
+  const ids = [...new Set([...Object.keys(before), ...Object.keys(after), ...Object.keys(observed)])].sort((a, b) => Number(a) - Number(b));
+  if (!ids.length) return el("div", { class: "audit-empty", text: "No mapped spools were captured." });
+
+  const wrap = el("div", { class: "audit-spool-list" });
+  for (const id of ids) {
+    const first = before[id] || {};
+    const last = after[id] || {};
+    const identity = Object.keys(first.filament || {}).length ? first.filament : (last.filament || {});
+    const slots = Object.entries(mappings).filter(([, spoolId]) => Number(spoolId) === Number(id)).map(([slot]) => slot);
+    const metric = observed[id] || {};
+    const swatch = el("span", { class: "audit-spool-swatch" });
+    swatch.style.background = normalizeColor(identity.color_hex, "#6b7280");
+    const title = [identity.vendor, identity.name].filter(Boolean).join(" ") || `Spool #${id}`;
+    const head = el("div", { class: "audit-spool-head" }, [
+      swatch,
+      el("div", { class: "audit-spool-name" }, [
+        el("strong", { text: title }),
+        el("span", { text: `#${id}${identity.material ? " · " + String(identity.material).toUpperCase() : ""}` }),
+      ]),
+      el("span", { class: "chip chip-muted", text: slots.length ? slots.join(", ") : "used spool" }),
+    ]);
+    const grid = el("div", { class: "audit-evidence-grid" }, [
+      el("div", {}, [el("span", { text: "Before remaining" }), el("strong", { text: `${auditSnapshotValue(first, "remaining_length_mm", fmtMm)} · ${auditSnapshotValue(first, "remaining_weight_g", fmtG)}` })]),
+      el("div", {}, [el("span", { text: "After remaining" }), el("strong", { text: `${auditSnapshotValue(last, "remaining_length_mm", fmtMm)} · ${auditSnapshotValue(last, "remaining_weight_g", fmtG)}` })]),
+      el("div", {}, [el("span", { text: "Expected deduction" }), el("strong", { text: auditMetric(metric.expected_mm) })]),
+      el("div", {}, [el("span", { text: "Observed used_length" }), el("strong", { text: auditMetric(metric.observed_mm) })]),
+    ]);
+    const card = el("section", { class: "audit-spool-card" }, [head, grid]);
+    const error = first.error || last.error;
+    if (error) card.appendChild(el("div", { class: "audit-inline-warning", text: error }));
+    wrap.appendChild(card);
+  }
+  return wrap;
+}
+
+function renderAuditTimeline(audit) {
+  const events = Array.isArray(audit.events) ? audit.events : [];
+  if (!events.length) return el("div", { class: "audit-empty", text: "No sync events were recorded." });
+  const latestByKey = new Map();
+  events.forEach((event, index) => latestByKey.set(event.record_key, index));
+  const wrap = el("div", { class: "audit-timeline" });
+  events.forEach((event, index) => {
+    const kind = syncStatusKind(event.status);
+    const row = el("div", { class: "audit-event" }, [
+      el("time", { text: fmtDateTime(event.at) }),
+      el("div", { class: "audit-event-main" }, [
+        el("strong", { text: `${event.phase || "sync"} · ${event.slot || "?"} → ${event.spool_id ? "#" + event.spool_id : "unmapped"} · ${auditMetric(event.used_mm)}` }),
+        event.error ? el("span", { text: event.error }) : el("span", { text: `attempt ${event.attempts || 0}` }),
+      ]),
+      el("span", { class: "status-chip", attrs: { "data-status": kind.key }, text: kind.label }),
+    ]);
+    const retryable = ["failed", "pending", "skipped_invalid_spool", "skipped_unmapped", "dry_run"].includes(String(event.status || ""));
+    if (latestByKey.get(event.record_key) === index && event.phase !== "live" && retryable) {
+      row.appendChild(el("button", {
+        class: "btn btn-secondary btn-mini",
+        text: "Sync now",
+        on: { click: () => retryAuditRecord(event.record_key, audit.audit_id) },
+      }));
+    }
+    wrap.appendChild(row);
+  });
+  return wrap;
+}
+
+async function openAuditModal(auditId) {
+  const modal = $("auditModal");
+  const body = $("auditModalBody");
+  if (!modal || !body) return;
+  modal.hidden = false;
+  body.innerHTML = "";
+  body.appendChild(el("div", { class: "audit-loading", text: "Loading audit…" }));
+  try {
+    const payload = await getJson(`/api/ui/audits/${encodeURIComponent(auditId)}`);
+    const audit = (payload.result || payload).audit;
+    $("auditModalTitle").textContent = audit.filename || "Print audit";
+    $("auditModalSub").textContent = `${audit.result || "printing"} · ${fmtDateTime(audit.completed_at || audit.started_at)}`;
+    body.innerHTML = "";
+    const verdict = auditVerdictKind(audit.verdict);
+    body.appendChild(el("div", { class: "audit-detail-head" }, [
+      el("span", { class: "status-chip", attrs: { "data-status": verdict.key }, text: verdict.label }),
+      el("p", { text: audit.reasoning || "No verdict reasoning is available yet." }),
+      el("a", { class: "btn btn-secondary btn-mini", text: "Download audit report", attrs: { href: `/api/ui/audits/${encodeURIComponent(audit.audit_id)}/export` } }),
+    ]));
+    body.appendChild(el("h4", { class: "audit-section-title", text: "Spool evidence" }));
+    body.appendChild(renderAuditSpools(audit));
+    if ((audit.warnings || []).length) {
+      body.appendChild(el("h4", { class: "audit-section-title", text: "Warnings" }));
+      body.appendChild(el("ul", { class: "audit-warnings" }, audit.warnings.map((warning) => el("li", { text: warning }))));
+    }
+    body.appendChild(el("h4", { class: "audit-section-title", text: "Raw sync-event timeline" }));
+    body.appendChild(renderAuditTimeline(audit));
+  } catch (error) {
+    body.innerHTML = "";
+    body.appendChild(el("div", { class: "audit-inline-warning", text: error?.message || String(error) }));
+  }
+}
+
+function renderPrintAudits(state) {
+  const wrap = $("auditList");
+  const meta = $("auditMeta");
+  if (!wrap) return;
+  wrap.innerHTML = "";
+  const audits = Array.isArray(latestAuditPayload.audits) ? latestAuditPayload.audits : [];
+  const legacy = Array.isArray(latestAuditPayload.legacy_records) ? latestAuditPayload.legacy_records : [];
+  if (meta) meta.textContent = `${audits.length} prints${legacy.length ? ` · ${legacy.length} legacy` : ""}`;
+
+  for (const audit of audits) {
+    const verdict = auditVerdictKind(audit.verdict);
+    const row = el("button", {
+      class: "audit-row",
+      attrs: { type: "button" },
+      on: { click: () => openAuditModal(audit.audit_id) },
+    }, [
+      el("div", { class: "audit-row-main" }, [
+        el("strong", { text: audit.filename || "(unnamed print)" }),
+        el("span", { text: `${audit.result || "printing"} · ${fmtDateTime(audit.completed_at || audit.started_at)}` }),
+      ]),
+      el("span", { class: "audit-spool-count", text: `${audit.spool_count || 0} spool${audit.spool_count === 1 ? "" : "s"}` }),
+      el("span", { class: "audit-usage", text: `${auditMetric(audit.expected_mm)} expected · ${auditMetric(audit.observed_mm)} observed` }),
+      el("span", { class: "status-chip", attrs: { "data-status": verdict.key }, text: verdict.label }),
+    ]);
+    wrap.appendChild(row);
+  }
+
+  for (const record of legacy.slice(0, 10)) {
+    const kind = syncStatusKind(record.status);
+    wrap.appendChild(el("div", { class: "audit-row audit-row-legacy" }, [
+      el("div", { class: "audit-row-main" }, [
+        el("strong", { text: record.job || "Legacy sync record" }),
+        el("span", { text: `${record.slot || "?"} → ${record.spool_id ? "#" + record.spool_id : "unmapped"} · ${auditMetric(record.used_mm)}` }),
+      ]),
+      el("span", { class: "chip chip-muted", text: "legacy — no audit verdict" }),
+      el("span", { class: "status-chip", attrs: { "data-status": kind.key }, text: kind.label }),
+    ]));
   }
 }
 
@@ -962,7 +1148,7 @@ function render(state) {
   }
 
   renderActiveJob(state, slots, connectedBoxes);
-  renderSyncRecords(state);
+  renderPrintAudits(state);
   renderHistory(state, slots, connectedBoxes);
   renderMoonHistory(state);
   renderWarnings(state);
@@ -972,7 +1158,7 @@ function render(state) {
   if (clearBtn) {
     clearBtn.hidden = !isDebugMode();
     clearBtn.disabled = !!state.job_track_name;
-    clearBtn.title = state.job_track_name ? "A print is being tracked" : "Clear local accounting / sync records";
+    clearBtn.title = state.job_track_name ? "A print is being tracked" : "Clear local accounting, sync records, and print audits";
   }
 }
 
@@ -980,8 +1166,12 @@ function render(state) {
 
 async function tick() {
   try {
-    const j = await getJson("/api/ui/state");
-    render(j.result || j);
+    const [statePayload, auditPayload] = await Promise.all([
+      getJson("/api/ui/state"),
+      getJson("/api/ui/audits"),
+    ]);
+    latestAuditPayload = auditPayload.result || auditPayload;
+    render(statePayload.result || statePayload);
   } catch {
     setCStat("printerBadge", "warn", "—");
     setCStat("cfsBadge", "warn", "—");
@@ -1040,7 +1230,7 @@ function initClearAccounting() {
   if (!btn) return;
   btn.onclick = async () => {
     if (!isDebugMode()) return;
-    if (!confirm("Clear local accounting data and sync records?\n\nThis only affects local bookkeeping. Spoolman is not touched.")) return;
+    if (!confirm("Clear local accounting data, sync records, and print audits?\n\nThis only affects local bookkeeping. Spoolman is not touched.")) return;
     await postJson("/api/ui/accounting/clear", {});
     await tick();
   };
@@ -1052,6 +1242,7 @@ function initKeyboard() {
     if (spoolmanPickerOpen) closeSpoolmanPicker();
     else if (settingsModalOpen) closeSettingsModal();
     else if (spoolModalOpen) closeSpoolModal();
+    else if (!$("auditModal")?.hidden) closeAuditModal();
   });
 }
 
