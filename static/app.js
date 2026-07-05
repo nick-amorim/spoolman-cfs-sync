@@ -897,6 +897,16 @@ function renderPrintAudits(state) {
   if (pager.childNodes.length) wrap.appendChild(pager);
 }
 
+function renderAuditUnavailable() {
+  const wrap = $("auditList");
+  const meta = $("auditMeta");
+  if (meta) meta.textContent = "—";
+  if (wrap) {
+    wrap.innerHTML = "";
+    wrap.appendChild(el("div", { class: "audit-empty", text: "Audit history unavailable" }));
+  }
+}
+
 /* ---------- history ---------- */
 
 const HIST_DEFAULT = 4;
@@ -1127,7 +1137,6 @@ function render(state) {
   }
 
   renderActiveJob(state, slots, connectedBoxes);
-  renderPrintAudits(state);
   renderHistory(state, slots, connectedBoxes);
   renderMoonHistory(state);
   renderWarnings(state);
@@ -1144,18 +1153,22 @@ function render(state) {
 /* ---------- polling ---------- */
 
 async function tick() {
+  const auditPromise = getJson("/api/ui/audits").then(
+    (auditPayload) => {
+      latestAuditPayload = auditPayload.result || auditPayload;
+      renderPrintAudits(latestState || {});
+    },
+    () => renderAuditUnavailable(),
+  );
   try {
-    const [statePayload, auditPayload] = await Promise.all([
-      getJson("/api/ui/state"),
-      getJson("/api/ui/audits"),
-    ]);
-    latestAuditPayload = auditPayload.result || auditPayload;
+    const statePayload = await getJson("/api/ui/state");
     render(statePayload.result || statePayload);
   } catch {
     setCStat("printerBadge", "warn", "—");
     setCStat("cfsBadge", "warn", "—");
     setCStat("spoolmanBadge", "warn", "—");
   }
+  await auditPromise;
 }
 
 let refreshTimer = null;

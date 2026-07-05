@@ -84,6 +84,7 @@ APP_UPDATE_LOCK = threading.Lock()
 AUDIT_LOCK = threading.RLock()
 
 AUDIT_RETENTION = 100
+AUDIT_EVENT_RETENTION = 1000
 UI_SYNC_RECORD_LIMIT = 50
 
 DEFAULT_SLOTS = [
@@ -970,6 +971,31 @@ def _empty_audit_store() -> dict:
     return {"version": 1, "active": None, "completed": []}
 
 
+def _audit_bound_event_history(audit: dict) -> dict:
+    events = audit.get("events") if isinstance(audit.get("events"), list) else []
+    latest_index_by_key = {
+        str(event.get("record_key")): index
+        for index, event in enumerate(events)
+        if isinstance(event, dict) and str(event.get("record_key") or "")
+    }
+    events = [
+        event for index, event in enumerate(events)
+        if not isinstance(event, dict)
+        or not str(event.get("record_key") or "")
+        or latest_index_by_key[str(event.get("record_key"))] == index
+    ]
+    try:
+        dropped = max(0, int(audit.get("events_dropped") or 0))
+    except Exception:
+        dropped = 0
+    if len(events) > AUDIT_EVENT_RETENTION:
+        dropped += len(events) - AUDIT_EVENT_RETENTION
+        events = events[-AUDIT_EVENT_RETENTION:]
+    audit["events"] = events
+    audit["events_dropped"] = dropped
+    return audit
+
+
 def load_audits() -> dict:
     with AUDIT_LOCK:
         try:
@@ -985,16 +1011,29 @@ def load_audits() -> dict:
         if not isinstance(completed, list):
             completed = []
         active = raw.get("active") if isinstance(raw.get("active"), dict) else None
-        return {"version": 1, "active": active, "completed": completed[:AUDIT_RETENTION]}
+        if isinstance(active, dict):
+            _audit_bound_event_history(active)
+        bounded_completed = []
+        for audit in completed[:AUDIT_RETENTION]:
+            if isinstance(audit, dict):
+                bounded_completed.append(_audit_bound_event_history(audit))
+        return {"version": 1, "active": active, "completed": bounded_completed}
 
 
 def save_audits(store: dict) -> None:
     with AUDIT_LOCK:
         completed = store.get("completed") if isinstance(store, dict) else []
+        active = store.get("active") if isinstance(store.get("active"), dict) else None
+        if isinstance(active, dict):
+            _audit_bound_event_history(active)
+        bounded_completed = []
+        for audit in list(completed if isinstance(completed, list) else [])[:AUDIT_RETENTION]:
+            if isinstance(audit, dict):
+                bounded_completed.append(_audit_bound_event_history(audit))
         payload = {
             "version": 1,
-            "active": store.get("active") if isinstance(store.get("active"), dict) else None,
-            "completed": list(completed if isinstance(completed, list) else [])[:AUDIT_RETENTION],
+            "active": active,
+            "completed": bounded_completed,
         }
         _write_json_atomic(AUDITS_PATH, payload)
 
@@ -1140,6 +1179,9 @@ def _audit_interrupt_active(store: dict, reason: str) -> None:
     warnings = list(active.get("warnings") or [])
     if reason not in warnings:
         warnings.append(reason)
+    dropped = int(active.get("events_dropped") or 0)
+    if dropped > 0:
+        warnings.append(f"Audit event retention omitted {dropped} oldest event{'s' if dropped != 1 else ''}.")
     active["warnings"] = warnings
     _audit_complete_in_store(store, active)
 
@@ -1153,7 +1195,7 @@ def _audit_ensure_active(
     *,
     late_tracking: bool = False,
 ) -> Optional[dict]:
-    if not _audit_configured(cfg) or not str(job_name or "").strip():
+    if not str(job_name or "").strip():
         return None
     late_tracking = bool(late_tracking or _job_track_total_mm(state) > 0)
     with AUDIT_LOCK:
@@ -1168,6 +1210,11 @@ def _audit_ensure_active(
             return active
         if isinstance(active, dict):
             _audit_interrupt_active(store, "A new print started before this audit could be finalized.")
+            if not _audit_configured(cfg):
+                save_audits(store)
+                return None
+        elif not _audit_configured(cfg):
+            return None
 
         print_key = _stable_print_key(job_name, start_ts, 0.0, job_id=job_id)
         frozen = _audit_sync_config(cfg)
@@ -1197,6 +1244,7 @@ def _audit_ensure_active(
             "expected": {"slots": {}, "spools": {}, "total_mm": 0.0, "moonraker_cap_mm": 0.0},
             "observed": {"spools": {}, "total_mm": None},
             "events": [],
+            "events_dropped": 0,
             "warnings": warnings,
             "late_tracking": bool(late_tracking),
         }
@@ -1264,11 +1312,16 @@ def _audit_record_event(key: str, record: dict) -> None:
             event["spoolman_response"] = _audit_compact_response(record.get("spoolman_response"))
         if "spoolman_validation" in record:
             event["spoolman_validation"] = _audit_compact_response(record.get("spoolman_validation"))
-        events = list(target.get("events") or [])
-        if events and events[-1] == event:
-            return
+        events = [
+            existing for existing in (target.get("events") or [])
+            if not isinstance(existing, dict) or str(existing.get("record_key") or "") != key
+        ]
         events.append(event)
+        dropped = max(0, len(events) - AUDIT_EVENT_RETENTION)
+        if dropped:
+            events = events[-AUDIT_EVENT_RETENTION:]
         target["events"] = events
+        target["events_dropped"] = int(target.get("events_dropped") or 0) + dropped
         if location == "active":
             store["active"] = target
         save_audits(store)
@@ -1337,9 +1390,25 @@ def _audit_finalize(
         if changed_slots:
             warnings.append("Mappings changed during the print; reconciliation used the frozen mappings for: " + ", ".join(changed_slots))
 
+        sync_records = getattr(state, "spoolman_sync_records", {})
+        audit_records = []
+        audit_record_keys = set()
+        if isinstance(sync_records, dict):
+            for record_key, record in sync_records.items():
+                if not isinstance(record, dict) or str(record.get("audit_id") or "") != str(audit.get("audit_id") or ""):
+                    continue
+                audit_records.append(record)
+                audit_record_keys.add(str(record_key))
+        for event in audit.get("events", []):
+            record_key = str(event.get("record_key") or "") if isinstance(event, dict) else ""
+            if not record_key or record_key in audit_record_keys:
+                continue
+            fallback_record = dict(event)
+            fallback_record["sync_phase"] = event.get("phase")
+            audit_records.append(fallback_record)
         event_spools = {
-            int(e.get("spool_id")) for e in audit.get("events", [])
-            if isinstance(e, dict) and isinstance(e.get("spool_id"), int) and e.get("spool_id") > 0
+            int(record.get("spool_id")) for record in audit_records
+            if isinstance(record.get("spool_id"), int) and record.get("spool_id") > 0
         }
         before = audit.get("snapshots", {}).get("before", {}) if isinstance(audit.get("snapshots"), dict) else {}
         snapshot_ids = {int(k) for k in before.keys() if str(k).isdigit()} | event_spools | {int(k) for k in spool_expected.keys()}
@@ -1375,18 +1444,19 @@ def _audit_finalize(
                 "difference_mm": (float(round(observed - inventory_expected, 3)) if observed is not None else None),
             }
 
-        events = list(audit.get("events") or [])
-        for event in events:
-            if not isinstance(event, dict):
-                continue
-            status = str(event.get("status") or "")
+        for record in audit_records:
+            status = str(record.get("status") or "")
             if status in ("timeout_uncertain", "conflict", "failed", "skipped_invalid_spool", "skipped_unmapped"):
-                warning = f"{event.get('phase')} record for slot {event.get('slot')} ended as {status}."
-                if event.get("error"):
-                    warning += " " + str(event.get("error"))
+                warning = f"{record.get('sync_phase')} record for slot {record.get('slot')} ended as {status}."
+                if record.get("error"):
+                    warning += " " + str(record.get("error"))
                 warnings.append(warning)
             if status == "skipped_invalid_spool":
                 evidence_missing = True
+
+        dropped = int(audit.get("events_dropped") or 0)
+        if dropped > 0:
+            warnings.append(f"Audit event retention omitted {dropped} oldest event{'s' if dropped != 1 else ''}.")
 
         total_expected = float(round(sum(slot_expected.values()), 3))
         normalized_result = str(result or "unknown").lower()

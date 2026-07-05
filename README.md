@@ -154,7 +154,11 @@ when a new job starts.
 
 Audits are stored separately from `data/state.json` in the ignored runtime file
 `data/print_audits.json`. The latest 100 completed audits plus any active audit
-are retained using atomic writes. The compact **Print Audits** panel initially
+are retained using atomic writes. Each audit retains the latest state for up to
+1,000 sync-record events. If older events are omitted, the audit includes an
+`events_dropped` count and a final warning describing the truncation. Verdicts
+and inventory evidence are calculated independently of this bounded raw event
+timeline. The compact **Print Audits** panel initially
 shows recent rows and provides incremental controls for older audits and legacy
 records. It opens a detailed spool/evidence/event view and offers a
 **Download audit report** action. Exported

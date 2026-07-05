@@ -285,6 +285,38 @@ def test_server_url_is_frozen_for_writes_and_final_snapshots(audit_env, monkeypa
     assert completed_audit()["verdict"] == "verified"
 
 
+def test_matching_audit_survives_removed_current_server_and_mappings(audit_env, monkeypatch):
+    state, cfg, inventory, calls = audit_env
+    seen_urls = []
+
+    def get_spool(spool_id, cfg=None):
+        seen_urls.append(cfg["url"])
+        return json.loads(json.dumps(inventory[int(spool_id)]))
+
+    def use_spool(spool_id, used_mm, cfg=None):
+        seen_urls.append(cfg["url"])
+        calls.append((int(spool_id), float(used_mm)))
+        inventory[int(spool_id)]["used_length"] += float(used_mm)
+        return {"id": int(spool_id)}
+
+    monkeypatch.setattr(appmod, "_spoolman_get_spool", get_spool)
+    monkeypatch.setattr(appmod, "_spoolman_use_spool", use_spool)
+    original_url = cfg["url"]
+    start_audit(state, cfg)
+    cfg["url"] = ""
+    cfg["slot_mappings"] = {}
+    state.job_track_slot_mm = {"1A": 40.0}
+    state.job_track_printer_used_mm = 40.0
+
+    appmod._plan_spoolman_sync_for_finished_job(state, "part.gcode", 10, 20, "complete", "job-1", 40.0)
+
+    audit = completed_audit()
+    assert calls == [(1, 40.0)]
+    assert seen_urls and set(seen_urls) == {original_url}
+    assert audit["config"]["slot_mappings"]["1A"] == 1
+    assert audit["verdict"] == "verified"
+
+
 def test_active_audit_without_frozen_server_fails_closed(audit_env):
     state, cfg, _inventory, _calls = audit_env
     start_audit(state, cfg)
@@ -430,6 +462,22 @@ def test_same_filename_new_job_id_preserves_interrupted_audit(audit_env):
     assert store["completed"][0]["verdict"] == "inconclusive"
 
 
+def test_unauditable_new_print_still_preserves_old_audit_as_interrupted(audit_env):
+    state, cfg, _inventory, _calls = audit_env
+    first = start_audit(state, cfg, filename="old.gcode", job_id="job-old")
+    cfg["url"] = ""
+    cfg["slot_mappings"] = {}
+
+    second = appmod._audit_ensure_active(state, cfg, "new.gcode", 20.0, "job-new")
+    store = appmod.load_audits()
+
+    assert second is None
+    assert store["active"] is None
+    assert store["completed"][0]["audit_id"] == first["audit_id"]
+    assert store["completed"][0]["result"] == "interrupted"
+    assert store["completed"][0]["verdict"] == "inconclusive"
+
+
 def test_restart_reuses_active_audit_without_resnapshot(audit_env, monkeypatch):
     state, cfg, inventory, _calls = audit_env
     count = {"value": 0}
@@ -444,6 +492,62 @@ def test_restart_reuses_active_audit_without_resnapshot(audit_env, monkeypatch):
 
     assert first["audit_id"] == second["audit_id"]
     assert count["value"] == 1
+
+
+def test_repeated_record_states_replace_the_existing_audit_event(audit_env):
+    state, cfg, _inventory, _calls = audit_env
+    audit = start_audit(state, cfg)
+    record = {
+        "audit_id": audit["audit_id"],
+        "sync_phase": "post_print",
+        "slot": "1A",
+        "spool_id": 1,
+        "used_mm": 25.0,
+        "status": "pending",
+        "attempts": 0,
+        "updated_at": 11.0,
+    }
+    appmod._audit_record_event("record-1", record)
+    record.update({"status": "synced", "attempts": 1, "updated_at": 12.0})
+    appmod._audit_record_event("record-1", record)
+
+    active = appmod.load_audits()["active"]
+    assert len(active["events"]) == 1
+    assert active["events"][0]["record_key"] == "record-1"
+    assert active["events"][0]["status"] == "synced"
+    assert active["events"][0]["attempts"] == 1
+    assert active["events_dropped"] == 0
+
+
+def test_audit_event_history_is_capped_and_tracks_dropped_events(audit_env, monkeypatch):
+    state, cfg, _inventory, _calls = audit_env
+    assert appmod.AUDIT_EVENT_RETENTION == 1000
+    monkeypatch.setattr(appmod, "AUDIT_EVENT_RETENTION", 3)
+    audit = start_audit(state, cfg)
+
+    for index in range(5):
+        appmod._audit_record_event(
+            f"record-{index}",
+            {
+                "audit_id": audit["audit_id"],
+                "sync_phase": "live",
+                "slot": "1A",
+                "spool_id": 1,
+                "used_mm": float(index),
+                "status": "synced",
+                "attempts": 1,
+                "updated_at": 11.0 + index,
+            },
+        )
+
+    active = appmod.load_audits()["active"]
+    assert [event["record_key"] for event in active["events"]] == ["record-2", "record-3", "record-4"]
+    assert active["events_dropped"] == 2
+
+    appmod._audit_finalize(state, cfg, "part.gcode", 10.0, 20.0, "complete", "job-1", 0.0)
+    audit = completed_audit()
+    assert audit["events_dropped"] == 2
+    assert "Audit event retention omitted 2 oldest events." in audit["warnings"]
 
 
 def test_retention_keeps_latest_100_completed_plus_active(audit_env):
