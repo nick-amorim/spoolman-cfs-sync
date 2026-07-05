@@ -51,7 +51,7 @@ The implementation is intentionally conservative:
 - per-slot Spoolman spool mapping
 - clear mapping button for empty CFS slots
 - post-print or live Spoolman usage sync
-- recent sync record history
+- automatic print-level audit history with downloadable JSON reports
 - manual retry for safe retryable records
 - debug mode for dry-run and local test-data cleanup controls
 - warning when Moonraker's native Spoolman integration appears to be enabled
@@ -114,6 +114,56 @@ Important statuses:
 
 `timeout_uncertain` is intentionally not retryable from the UI. Check Spoolman
 inventory manually before deciding what to do.
+
+## Automatic Print Audits
+
+When a Spoolman URL and at least one slot mapping are configured, the app
+automatically opens a print audit. Before the first possible write it freezes
+the Spoolman server URL, slot mappings, and sync settings, then snapshots each
+distinct mapped spool. This means server or mapping changes made during a print
+cannot redirect that print's automatic deductions.
+
+Current safety controls remain authoritative in the safer direction: disabling
+sync or enabling dry-run immediately stops real writes for an active print.
+Re-enabling sync or disabling dry-run cannot arm a print that began disabled or
+in dry-run mode.
+
+After the print completes, is cancelled, or fails, the app runs the normal
+final reconciliation first and then captures final inventory. Expected usage is
+the per-slot parser result capped by Moonraker's raw
+`print_stats.filament_used`. Slots sharing one spool are aggregated. The audit
+compares expected usage with the change in Spoolman's `used_length`; weight is
+shown only as supporting evidence.
+
+Audit verdicts:
+
+| Verdict | Meaning |
+| --- | --- |
+| `in_progress` | The print is active and final evidence is not available yet. |
+| `verified` | Each spool's observed `used_length` change matches expected capped usage within 1 mm. |
+| `needs_attention` | Complete evidence shows a missing or excess deduction. External inventory changes may be involved. |
+| `inconclusive` | Snapshots, frozen mappings, or lifecycle evidence are insufficient. |
+| `dry_run` | The print was audited while dry-run mode prevented writes. |
+| `sync_disabled` | Sync was disabled in the configuration frozen at print start. |
+| `no_usage` | No capped filament usage was reported for the print. |
+
+A timeout-uncertain event remains visible as a warning, but the final verdict
+can still be `verified` when before/after inventory proves the correct result.
+Interrupted prints are preserved as inconclusive instead of being overwritten
+when a new job starts.
+
+Audits are stored separately from `data/state.json` in the ignored runtime file
+`data/print_audits.json`. The latest 100 completed audits plus any active audit
+are retained using atomic writes. Each audit retains the latest state for up to
+1,000 sync-record events. If older events are omitted, the audit includes an
+`events_dropped` count and a final warning describing the truncation. Verdicts
+and inventory evidence are calculated independently of this bounded raw event
+timeline. The compact **Print Audits** panel initially
+shows recent rows and provides incremental controls for older audits and legacy
+records. It opens a detailed spool/evidence/event view and offers a
+**Download audit report** action. Exported
+JSON contains the frozen evidence, reasoning, warnings, and compact sync events;
+configured URLs and raw CFS payloads are excluded.
 
 ## Requirements
 
@@ -316,9 +366,9 @@ Click a slot to open the local spool editor:
 - **New spool (g)** starts a new local spool epoch for that slot.
 
 This is local display/accounting only. Spoolman inventory is changed only by the
-Spoolman sync records.
+sync operations represented in Print Audits and their underlying safety records.
 
-### Spoolman Sync
+### Spoolman Sync and Print Audits
 
 Controls Spoolman integration:
 
@@ -328,20 +378,22 @@ Controls Spoolman integration:
 - live sync threshold in millimeters
 - connection test
 - slot-to-spool mappings
-- recent sync records
-- retry buttons for retryable records
+- compact print-level audit rows with expected and observed usage
+- detailed before/after spool evidence, warnings, and raw sync-event timeline
+- report download and retry buttons for eligible non-live records
 
 Mapped rows display spool color, id, name, material, and remaining weight when
-Spoolman details are available. Live sync records are informational and are not
-manually retryable from the UI; later live chunks or the final record handle
-reconciliation.
+Spoolman details are available. Records created before Print Audits remain
+visible as legacy records without an invented verdict. Live sync records are
+informational and are not manually retryable; later live chunks or the final
+record handle reconciliation.
 
 ### Debug Mode
 
 Open **Settings** and enable **Debug mode** to reveal:
 
 - Dry-run toggle
-- Clear Test Data button
+- Clear data button, which clears local history, sync records, and audit history
 
 Normal use should keep debug mode off.
 
@@ -417,7 +469,9 @@ Open a pull request into your fork's `main`. The repository is configured for:
 | `scripts/proxmox/` | Proxmox LXC installer and update helper scripts. |
 | `data/config.json` | Local runtime config, ignored by Git. |
 | `data/state.json` | Local runtime state, ignored by Git. |
+| `data/print_audits.json` | Atomic print-audit history, ignored by Git. |
 | `tests/test_spoolman_sync.py` | Regression tests for sync and parser behavior. |
+| `tests/test_print_audits.py` | Regression tests for audit lifecycle, verdicts, retention, and export. |
 | `.github/workflows/tests.yml` | CI workflow. |
 
 ## Current Limitations

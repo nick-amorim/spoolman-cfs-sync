@@ -87,13 +87,13 @@
       </section>
 
       <div class="two-col">
-        <!-- Spoolman sync records -->
-        <section class="panel" aria-labelledby="syncTitle">
+        <!-- Print-level Spoolman audits -->
+        <section class="panel" aria-labelledby="auditTitle">
           <header class="panel-head">
-            <h2 id="syncTitle" class="panel-title">Sync Records</h2>
-            <div id="syncMeta" class="panel-meta">&mdash;</div>
+            <h2 id="auditTitle" class="panel-title">Print Audits</h2>
+            <div id="auditMeta" class="panel-meta">&mdash;</div>
           </header>
-          <div id="syncList" class="sync-list"></div>
+          <div id="auditList" class="audit-list"></div>
         </section>
 
         <!-- Per-slot history -->
@@ -167,6 +167,23 @@
                  placeholder="Search filament, material, vendor, or spool ID" autocomplete="off" />
           <div id="spoolmanPickerStatus" class="picker-status">&mdash;</div>
           <div id="spoolmanPickerList" class="picker-list" role="listbox"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ===== Print audit detail modal ===== -->
+    <div id="auditModal" class="modal" hidden role="dialog" aria-modal="true" aria-labelledby="auditModalTitle">
+      <div class="modal-backdrop" data-close="audit"></div>
+      <div class="modal-panel modal-panel-audit">
+        <header class="modal-head">
+          <div>
+            <h3 class="modal-title" id="auditModalTitle">Print audit</h3>
+            <div class="modal-sub" id="auditModalSub">&mdash;</div>
+          </div>
+          <button class="modal-close" data-close="audit" aria-label="Close">&times;</button>
+        </header>
+        <div class="modal-body audit-modal-body" id="auditModalBody">
+          <div class="audit-loading">Loading audit&hellip;</div>
         </div>
       </div>
     </div>
@@ -288,6 +305,6 @@
       </aside>
     </div>
 
-    <script src="/static/app.js?v=redesign-2"></script>
+    <script src="/static/app.js?v=print-audits-2"></script>
   </body>
 </html>

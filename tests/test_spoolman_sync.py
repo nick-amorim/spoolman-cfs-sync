@@ -7,6 +7,11 @@ import main as appmod
 from models.schemas import UiSpoolmanRetryRequest
 
 
+@pytest.fixture(autouse=True)
+def isolated_audit_store(monkeypatch, tmp_path):
+    monkeypatch.setattr(appmod, "AUDITS_PATH", tmp_path / "print_audits.json")
+
+
 @pytest.fixture
 def state(monkeypatch):
     st = appmod.default_state()
@@ -494,7 +499,7 @@ def test_dry_run_records_mapped_usage_without_network(monkeypatch, state):
     state.job_track_slot_mm = {"1A": 250}
     state.job_track_slot_g = {"1A": 0.75}
     monkeypatch.setattr(appmod, "load_config", lambda: {"spoolman": spoolman_config(dry_run=True, mappings={"1A": 12})})
-    monkeypatch.setattr(appmod, "_spoolman_get_spool", lambda *args, **kwargs: pytest.fail("network called"))
+    monkeypatch.setattr(appmod, "_spoolman_get_spool", lambda spool_id, cfg=None: {"id": spool_id, "used_length": 10})
     monkeypatch.setattr(appmod, "_spoolman_use_spool", lambda *args, **kwargs: pytest.fail("network called"))
 
     appmod._plan_spoolman_sync_for_finished_job(state, "part.gcode", 10, 20, "complete", job_id="job-123")
