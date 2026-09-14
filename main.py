@@ -43,6 +43,7 @@ from models.schemas import (
     UiSlotUpdateRequest,
     UiPrinterConfigRequest,
     UiSpoolmanConfigRequest,
+    UiSpoolmanAuditFixRequest,
     UiSpoolmanMappingRequest,
     UiSpoolmanRetryRequest,
     UpdateSlotRequest,
@@ -82,10 +83,14 @@ AUDITS_PATH = DATA_DIR / "print_audits.json"
 MOONRAKER_POLL_TASK: Optional[asyncio.Task] = None
 APP_UPDATE_LOCK = threading.Lock()
 AUDIT_LOCK = threading.RLock()
+# Serializes the read-check-write sequence for manual audit corrections without
+# holding the audit persistence lock during Spoolman network calls.
+AUDIT_FIX_LOCK = threading.Lock()
 
 AUDIT_RETENTION = 100
 AUDIT_EVENT_RETENTION = 1000
 UI_SYNC_RECORD_LIMIT = 50
+AUDIT_TOLERANCE_MM = 1.0
 
 DEFAULT_SLOTS = [
     "1A", "1B", "1C", "1D",
@@ -1524,8 +1529,168 @@ def _audit_summary(audit: dict) -> dict:
     }
 
 
-def _audit_refresh_after_retry(audit_id: str, cfg: dict) -> None:
-    """Refresh completed inventory evidence after an explicitly requested safe retry."""
+def _audit_expected_inventory_change(audit: dict, spool_id: int) -> Optional[float]:
+    """Return the audited inventory delta for one spool, preserving old audits."""
+    key = str(int(spool_id))
+    observed = audit.get("observed") if isinstance(audit.get("observed"), dict) else {}
+    metrics = observed.get("spools") if isinstance(observed.get("spools"), dict) else {}
+    metric = metrics.get(key) if isinstance(metrics.get(key), dict) else {}
+    recorded = _audit_number(metric.get("expected_inventory_change_mm"))
+    if recorded is not None:
+        return float(round(recorded, 3))
+
+    expected = audit.get("expected") if isinstance(audit.get("expected"), dict) else {}
+    spools = expected.get("spools") if isinstance(expected.get("spools"), dict) else {}
+    raw_expected = _audit_number(spools.get(key))
+    if raw_expected is None:
+        return None
+    frozen = audit.get("config") if isinstance(audit.get("config"), dict) else {}
+    return float(round(raw_expected if bool(frozen.get("enabled")) and not bool(frozen.get("dry_run")) else 0.0, 3))
+
+
+def _audit_source_slots(audit: dict, spool_id: int) -> list[str]:
+    frozen = audit.get("config") if isinstance(audit.get("config"), dict) else {}
+    mappings = frozen.get("slot_mappings") if isinstance(frozen.get("slot_mappings"), dict) else {}
+    slots = []
+    for slot, mapped_id in mappings.items():
+        try:
+            if int(mapped_id) == int(spool_id):
+                slots.append(str(slot).upper())
+        except Exception:
+            continue
+    return sorted(set(slots))
+
+
+def _audit_spool_records(audit: dict, state: Optional[AppState], spool_id: int) -> list[dict]:
+    """Read current records plus retained audit events for one audited spool."""
+    audit_id = str(audit.get("audit_id") or "")
+    records = []
+    known_keys = set()
+    stored = getattr(state, "spoolman_sync_records", {}) if state is not None else {}
+    if isinstance(stored, dict):
+        for record_key, record in stored.items():
+            if not isinstance(record, dict) or str(record.get("audit_id") or "") != audit_id:
+                continue
+            try:
+                matches_spool = int(record.get("spool_id")) == int(spool_id)
+            except Exception:
+                matches_spool = False
+            if matches_spool:
+                records.append(record)
+                known_keys.add(str(record_key))
+    for event in audit.get("events", []):
+        if not isinstance(event, dict):
+            continue
+        record_key = str(event.get("record_key") or "")
+        if record_key and record_key in known_keys:
+            continue
+        try:
+            matches_spool = int(event.get("spool_id")) == int(spool_id)
+        except Exception:
+            matches_spool = False
+        if not matches_spool:
+            continue
+        fallback = dict(event)
+        fallback["sync_phase"] = event.get("phase")
+        records.append(fallback)
+    return records
+
+
+def _audit_blocking_records(audit: dict, state: Optional[AppState], spool_id: int) -> list[dict]:
+    return [
+        record for record in _audit_spool_records(audit, state, spool_id)
+        if str(record.get("status") or "") in {"timeout_uncertain", "conflict"}
+    ]
+
+
+def _audit_remediation(audit: dict, state: Optional[AppState], current_cfg: dict) -> dict:
+    """Describe safe, per-spool audit remediation without performing any write."""
+    expected = audit.get("expected") if isinstance(audit.get("expected"), dict) else {}
+    expected_spools = expected.get("spools") if isinstance(expected.get("spools"), dict) else {}
+    observed = audit.get("observed") if isinstance(audit.get("observed"), dict) else {}
+    observed_spools = observed.get("spools") if isinstance(observed.get("spools"), dict) else {}
+    snapshots = audit.get("snapshots") if isinstance(audit.get("snapshots"), dict) else {}
+    before = snapshots.get("before") if isinstance(snapshots.get("before"), dict) else {}
+    after = snapshots.get("after") if isinstance(snapshots.get("after"), dict) else {}
+    ids = sorted(
+        {str(value) for value in [*expected_spools, *observed_spools, *before, *after] if str(value).isdigit()},
+        key=int,
+    )
+    frozen = audit.get("config") if isinstance(audit.get("config"), dict) else {}
+    frozen_url = str(frozen.get("url") or "").strip().rstrip("/")
+    current_enabled = bool(current_cfg.get("enabled", False))
+    current_dry_run = bool(current_cfg.get("dry_run", True))
+    completed_attention = (
+        str(audit.get("status") or "") == "completed"
+        and str(audit.get("verdict") or "") == "needs_attention"
+    )
+    remediation = {}
+    for key in ids:
+        spool_id = int(key)
+        metric = observed_spools.get(key) if isinstance(observed_spools.get(key), dict) else {}
+        before_snapshot = before.get(key) if isinstance(before.get(key), dict) else {}
+        before_used_mm = _audit_number(before_snapshot.get("used_length_mm"))
+        expected_mm = _audit_expected_inventory_change(audit, spool_id)
+        observed_mm = _audit_number(metric.get("observed_mm"))
+        difference_mm = (
+            float(round(observed_mm - expected_mm, 3))
+            if observed_mm is not None and expected_mm is not None else None
+        )
+        missing_mm = float(round(max(0.0, -difference_mm), 3)) if difference_mm is not None else None
+        excess_mm = float(round(max(0.0, difference_mm), 3)) if difference_mm is not None else None
+        item = {
+            "spool_id": spool_id,
+            "source_slots": _audit_source_slots(audit, spool_id),
+            "expected_inventory_change_mm": expected_mm,
+            "observed_mm": observed_mm,
+            "missing_mm": missing_mm,
+            "excess_mm": excess_mm,
+            "kind": "not_actionable",
+            "can_fix": False,
+            "reason": "This spool does not need a correction.",
+        }
+        if before_used_mm is None:
+            item.update({"kind": "inconclusive", "reason": "The starting used_length evidence is unavailable."})
+        elif observed_mm is None or expected_mm is None:
+            item.update({"kind": "inconclusive", "reason": "Comparable before/after used_length evidence is unavailable."})
+        elif expected_mm <= AUDIT_TOLERANCE_MM:
+            item.update({"kind": "not_actionable", "reason": "This audit has no positive expected inventory deduction for the spool."})
+        elif observed_mm < -AUDIT_TOLERANCE_MM:
+            item.update({"kind": "inconclusive", "reason": "Spoolman used_length decreased during the audit; correct it manually after review."})
+        elif excess_mm is not None and excess_mm > AUDIT_TOLERANCE_MM:
+            item.update({"kind": "excess_manual", "reason": "The spool was deducted too much. Correct excess deductions manually in Spoolman."})
+        elif missing_mm is None or missing_mm <= AUDIT_TOLERANCE_MM:
+            item.update({"kind": "balanced", "reason": "The current evidence is within the 1 mm audit tolerance."})
+        elif not completed_attention:
+            item.update({"kind": "not_actionable", "reason": "Only completed audits marked Needs attention can be corrected."})
+        else:
+            blockers = _audit_blocking_records(audit, state, spool_id)
+            if blockers:
+                statuses = ", ".join(sorted({str(record.get("status")) for record in blockers}))
+                item.update({"kind": "blocked_missing", "reason": f"A {statuses} sync record may already have changed inventory; verify Spoolman manually."})
+            elif not frozen_url:
+                item.update({"kind": "blocked_missing", "reason": "The audit did not retain its original Spoolman server; correction is blocked."})
+            elif not current_enabled or current_dry_run:
+                item.update({"kind": "blocked_missing", "reason": "Enable real Spoolman sync and turn off dry-run before correcting this audit."})
+            else:
+                item.update({"kind": "fixable_missing", "can_fix": True, "reason": "A fresh inventory check is required before the correction is sent."})
+        remediation[key] = item
+    return {"audit_id": str(audit.get("audit_id") or ""), "spools": remediation}
+
+
+def _audit_fix_record_key(audit_id: str, spool_id: int, before_used_mm: float, checked_used_mm: float, missing_mm: float) -> str:
+    basis = f"{audit_id}:{int(spool_id)}:{before_used_mm:.3f}:{checked_used_mm:.3f}:{missing_mm:.3f}"
+    digest = hashlib.sha256(basis.encode("utf-8", errors="replace")).hexdigest()[:20]
+    return f"audit-fix:{audit_id}:{int(spool_id)}:{digest}"
+
+
+def _audit_refresh_after_retry(
+    audit_id: str,
+    cfg: dict,
+    *,
+    refresh_note: str = "Final inventory evidence was refreshed after a user-requested safe retry.",
+) -> None:
+    """Refresh completed inventory evidence after an explicitly requested manual action."""
     with AUDIT_LOCK:
         store = load_audits()
         audit = next(
@@ -1568,6 +1733,7 @@ def _audit_refresh_after_retry(audit_id: str, cfg: dict) -> None:
                     discrepancies.append((spool_id, expected_mm, observed_mm))
             observed_spools[key] = {
                 "expected_mm": expected_mm,
+                "expected_inventory_change_mm": expected_mm,
                 "observed_mm": observed_mm,
                 "difference_mm": (float(round(observed_mm - expected_mm, 3)) if observed_mm is not None else None),
             }
@@ -1591,7 +1757,7 @@ def _audit_refresh_after_retry(audit_id: str, cfg: dict) -> None:
         audit["verdict"] = verdict
         audit["reasoning"] = reasoning
         warnings = list(audit.get("warnings") or [])
-        warnings.append("Final inventory evidence was refreshed after a user-requested safe retry.")
+        warnings.append(refresh_note)
         audit["warnings"] = list(dict.fromkeys(warnings))
         save_audits(store)
 
@@ -3246,7 +3412,9 @@ def api_ui_audit_detail(audit_id: str) -> ApiResponse:
     audit = _find_audit(str(audit_id or "").strip())
     if not isinstance(audit, dict):
         raise HTTPException(status_code=404, detail="Unknown print audit")
-    return ApiResponse(result={"audit": audit})
+    state = load_state()
+    cfg = _normalize_spoolman_config(load_config())
+    return ApiResponse(result={"audit": audit, "remediation": _audit_remediation(audit, state, cfg)})
 
 
 def _sanitized_audit_export(value: Any) -> Any:
@@ -3384,6 +3552,11 @@ def api_ui_spoolman_retry(req: UiSpoolmanRetryRequest) -> ApiResponse:
     if not isinstance(rec, dict):
         raise HTTPException(status_code=404, detail="Unknown Spoolman sync record")
     status = str(rec.get("status") or "")
+    if str(rec.get("sync_phase") or "") == "audit_fix":
+        raise HTTPException(
+            status_code=409,
+            detail="Audit corrections require a fresh inventory check and cannot be retried from Sync now.",
+        )
     if status == "timeout_uncertain":
         raise HTTPException(
             status_code=409,
@@ -3416,6 +3589,145 @@ def api_ui_spoolman_retry(req: UiSpoolmanRetryRequest) -> ApiResponse:
     if audit_id:
         _audit_refresh_after_retry(audit_id, cfg)
     return ApiResponse(result=_ui_state_dict(load_state()))
+
+
+@app.post("/api/ui/spoolman/audit-fix", response_model=ApiResponse)
+def api_ui_spoolman_audit_fix(req: UiSpoolmanAuditFixRequest) -> ApiResponse:
+    """Apply one user-confirmed audit shortfall after a fresh Spoolman read.
+
+    This intentionally never reverses an excess deduction.  An audit cannot
+    prove whether excess use_length came from this app or another inventory
+    actor, while a positive shortfall can be safely completed with one fresh,
+    explicitly confirmed length-only deduction.
+    """
+    audit_id = str(req.audit_id or "").strip()
+    spool_id = int(req.spool_id)
+    submitted_missing_mm = float(round(float(req.expected_missing_mm), 3))
+    with AUDIT_FIX_LOCK:
+        state = load_state()
+        audit = _find_audit(audit_id)
+        if not isinstance(audit, dict):
+            raise HTTPException(status_code=404, detail="Unknown print audit")
+
+        current_cfg = _normalize_spoolman_config(load_config())
+        remediation = _audit_remediation(audit, state, current_cfg)
+        item = remediation.get("spools", {}).get(str(spool_id))
+        if not isinstance(item, dict) or not bool(item.get("can_fix")):
+            detail = item.get("reason") if isinstance(item, dict) else "This spool is not part of a correctable audit discrepancy."
+            raise HTTPException(status_code=409, detail=detail)
+
+        expected_mm = _audit_expected_inventory_change(audit, spool_id)
+        snapshots = audit.get("snapshots") if isinstance(audit.get("snapshots"), dict) else {}
+        before = snapshots.get("before") if isinstance(snapshots.get("before"), dict) else {}
+        before_snapshot = before.get(str(spool_id)) if isinstance(before.get(str(spool_id)), dict) else {}
+        before_used_mm = _audit_number(before_snapshot.get("used_length_mm"))
+        if expected_mm is None or expected_mm <= AUDIT_TOLERANCE_MM or before_used_mm is None:
+            raise HTTPException(status_code=409, detail="This audit lacks the positive expected usage and starting used_length needed for a correction.")
+
+        frozen = audit.get("config") if isinstance(audit.get("config"), dict) else {}
+        frozen_url = str(frozen.get("url") or "").strip().rstrip("/")
+        if not frozen_url:
+            raise HTTPException(status_code=409, detail="This audit did not retain its original Spoolman server; correction is blocked.")
+
+        evidence_cfg = dict(current_cfg)
+        evidence_cfg["url"] = frozen_url
+        if _audit_number(frozen.get("timeout_sec")) is not None:
+            evidence_cfg["timeout_sec"] = float(frozen["timeout_sec"])
+        evidence_cfg["slot_mappings"] = dict(frozen.get("slot_mappings") or {})
+        try:
+            spool = _spoolman_get_spool(spool_id, evidence_cfg)
+            if not isinstance(spool, dict):
+                raise ValueError("Spoolman returned a non-object spool response")
+            checked_used_mm = _audit_first_number(spool, "used_length", "used_length_mm")
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"Could not read fresh Spoolman inventory evidence: {e}") from e
+        if checked_used_mm is None:
+            raise HTTPException(status_code=409, detail="Spoolman did not return used_length for this spool; correction is blocked.")
+
+        fresh_observed_mm = float(round(checked_used_mm - before_used_mm, 3))
+        fresh_difference_mm = float(round(fresh_observed_mm - expected_mm, 3))
+        if fresh_observed_mm < -AUDIT_TOLERANCE_MM:
+            _audit_refresh_after_retry(
+                audit_id,
+                evidence_cfg,
+                refresh_note="Final inventory evidence was refreshed after an audit correction check found an unexpected used_length decrease.",
+            )
+            raise HTTPException(status_code=409, detail="Spoolman used_length decreased since the audit; correct it manually after review.")
+        if fresh_difference_mm > AUDIT_TOLERANCE_MM:
+            _audit_refresh_after_retry(
+                audit_id,
+                evidence_cfg,
+                refresh_note="Final inventory evidence was refreshed after an audit correction check found an excess deduction.",
+            )
+            raise HTTPException(status_code=409, detail="Spoolman now shows an excess deduction; corrections only address confirmed shortfalls.")
+        fresh_missing_mm = float(round(max(0.0, -fresh_difference_mm), 3))
+        if fresh_missing_mm <= AUDIT_TOLERANCE_MM:
+            _audit_refresh_after_retry(
+                audit_id,
+                evidence_cfg,
+                refresh_note="Final inventory evidence was refreshed after an audit correction check found no remaining shortfall.",
+            )
+            refreshed = _find_audit(audit_id) or audit
+            return ApiResponse(result={
+                "audit": refreshed,
+                "remediation": _audit_remediation(refreshed, state, current_cfg),
+                "correction": {"status": "not_needed", "missing_mm": fresh_missing_mm},
+            })
+        if abs(submitted_missing_mm - fresh_missing_mm) > 0.0005:
+            _audit_refresh_after_retry(
+                audit_id,
+                evidence_cfg,
+                refresh_note="Final inventory evidence was refreshed after an audit correction check found a changed shortfall.",
+            )
+            raise HTTPException(
+                status_code=409,
+                detail=f"The shortfall changed from {submitted_missing_mm:.3f} mm to {fresh_missing_mm:.3f} mm. Review the refreshed audit before correcting it.",
+            )
+
+        # Re-read the user-controlled safety gates immediately before the write;
+        # the frozen URL/mapping still determines the correction destination.
+        latest_cfg = _normalize_spoolman_config(load_config())
+        if not bool(latest_cfg.get("enabled", False)) or bool(latest_cfg.get("dry_run", True)):
+            raise HTTPException(status_code=409, detail="Enable real Spoolman sync and turn off dry-run before correcting this audit.")
+        write_cfg = dict(latest_cfg)
+        write_cfg["url"] = frozen_url
+        write_cfg["slot_mappings"] = dict(frozen.get("slot_mappings") or {})
+        if _audit_number(frozen.get("timeout_sec")) is not None:
+            write_cfg["timeout_sec"] = float(frozen["timeout_sec"])
+
+        source_slots = _audit_source_slots(audit, spool_id)
+        key = _audit_fix_record_key(audit_id, spool_id, before_used_mm, checked_used_mm, fresh_missing_mm)
+        record = _base_spoolman_record(
+            job_key=f"audit-fix:{audit_id}",
+            job_name=str(audit.get("filename") or "Print audit correction"),
+            slot_id=",".join(source_slots) or "audit",
+            spool_id=spool_id,
+            used_mm=fresh_missing_mm,
+            used_g=0.0,
+            result=str(audit.get("result") or "completed"),
+        )
+        record.update({
+            "sync_phase": "audit_fix",
+            "audit_id": audit_id,
+            "source_slots": source_slots,
+            "audit_expected_mm": float(round(expected_mm, 3)),
+            "audit_observed_before_fix_mm": fresh_observed_mm,
+            "audit_missing_mm": fresh_missing_mm,
+            "audit_before_used_length_mm": float(round(before_used_mm, 3)),
+            "audit_checked_used_length_mm": float(round(checked_used_mm, 3)),
+        })
+        corrected = _spoolman_sync_record(state, key, record, write_cfg)
+        _audit_refresh_after_retry(
+            audit_id,
+            write_cfg,
+            refresh_note="Final inventory evidence was refreshed after a user-confirmed audit correction.",
+        )
+        refreshed = _find_audit(audit_id) or audit
+        return ApiResponse(result={
+            "audit": refreshed,
+            "remediation": _audit_remediation(refreshed, state, latest_cfg),
+            "correction": {"record_key": key, "status": corrected.get("status"), "missing_mm": fresh_missing_mm},
+        })
 
 
 @app.post("/api/ui/accounting/clear", response_model=ApiResponse)

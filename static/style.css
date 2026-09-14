@@ -534,6 +534,14 @@ button.audit-row:hover { background: var(--surface-3); border-color: var(--accen
 .audit-evidence-grid span, .audit-evidence-grid strong { display: block; }
 .audit-evidence-grid span { font-size: 10px; color: var(--text-mute); text-transform: uppercase; letter-spacing: .04em; }
 .audit-evidence-grid strong { margin-top: 4px; font: 12px var(--font-mono); color: var(--text); }
+.audit-remediation {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  margin-top: 10px; padding: 9px 10px; border: 1px solid var(--line); border-radius: var(--r-sm);
+  font-size: 11px; line-height: 1.4;
+}
+.audit-remediation-fix { background: color-mix(in oklab, var(--accent) 10%, var(--surface-1)); color: var(--text-dim); }
+.audit-remediation-manual { border-color: var(--warn-line); background: var(--warn-bg); color: var(--warn); }
+.audit-remediation .btn { flex: 0 0 auto; }
 .audit-inline-warning { margin-top: 9px; padding: 8px 10px; border: 1px solid var(--warn-line); border-radius: var(--r-sm); background: var(--warn-bg); color: var(--warn); font-size: 11px; word-break: break-word; }
 .audit-warnings { margin: 0; padding: 10px 10px 10px 30px; border: 1px solid var(--warn-line); border-radius: var(--r-md); background: var(--warn-bg); color: var(--warn); font-size: 12px; }
 .audit-warnings li + li { margin-top: 5px; }
@@ -831,6 +839,7 @@ button.audit-row:hover { background: var(--surface-3); border-color: var(--accen
   .audit-detail-head .btn { justify-self: start; }
   .audit-event { grid-template-columns: 1fr auto; }
   .audit-event time { grid-column: 1 / -1; }
+  .audit-remediation { align-items: flex-start; flex-direction: column; }
 }
 
 @media (max-width: 520px) {
