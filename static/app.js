@@ -106,13 +106,24 @@ async function postJson(url, payload) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload || {}),
   });
-  if (!r.ok) throw new Error(await r.text().catch(() => `HTTP ${r.status}`));
+  if (!r.ok) throw new Error(await responseError(r));
   return r.json();
 }
 async function getJson(url) {
   const r = await fetch(url, { cache: "no-store" });
-  if (!r.ok) throw new Error(await r.text().catch(() => `HTTP ${r.status}`));
+  if (!r.ok) throw new Error(await responseError(r));
   return r.json();
+}
+
+async function responseError(response) {
+  const raw = await response.text().catch(() => "");
+  try {
+    const parsed = JSON.parse(raw);
+    if (typeof parsed?.detail === "string" && parsed.detail) return parsed.detail;
+  } catch (_) {
+    // Keep a non-JSON response as the fallback message below.
+  }
+  return raw || `HTTP ${response.status}`;
 }
 
 /* ---------- slot / spool helpers ---------- */
@@ -678,6 +689,13 @@ function auditMetric(value) {
   return Number.isFinite(number) ? fmtMm(number) : "—";
 }
 
+function auditFixLengthMm(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? `${number.toFixed(3)} mm` : "—";
+}
+
+const auditModalNotices = new Map();
+
 function closeAuditModal() {
   const modal = $("auditModal");
   if (modal) modal.hidden = true;
@@ -689,17 +707,42 @@ async function retryAuditRecord(recordKey, auditId) {
   if (auditId) await openAuditModal(auditId);
 }
 
+async function fixAuditSpool(audit, spoolId, missingMm, button) {
+  const amount = Number(missingMm);
+  if (!Number.isFinite(amount) || amount <= 0) return;
+  if (!confirm(`Deduct the confirmed missing ${auditFixLengthMm(amount)} from Spoolman spool #${spoolId}?\n\nThe app will check its current used_length immediately before sending this correction. If the shortfall changed, it will not write anything.`)) return;
+  button.disabled = true;
+  button.textContent = "Checking…";
+  try {
+    const payload = await postJson("/api/ui/spoolman/audit-fix", {
+      audit_id: audit.audit_id,
+      spool_id: Number(spoolId),
+      expected_missing_mm: amount,
+    });
+    const correction = (payload.result || payload).correction || {};
+    const status = correction.status === "synced"
+      ? "Audit correction sent. Final inventory evidence was refreshed."
+      : "The correction was not needed; final inventory evidence was refreshed.";
+    auditModalNotices.set(audit.audit_id, status);
+    await tick();
+  } catch (error) {
+    auditModalNotices.set(audit.audit_id, error?.message || String(error));
+  }
+  await openAuditModal(audit.audit_id);
+}
+
 function auditSnapshotValue(snapshot, key, formatter) {
   if (!snapshot || snapshot.available !== true) return "unavailable";
   const value = Number(snapshot[key]);
   return Number.isFinite(value) ? formatter(value) : "—";
 }
 
-function renderAuditSpools(audit) {
+function renderAuditSpools(audit, remediation) {
   const snapshots = audit.snapshots || {};
   const before = snapshots.before || {};
   const after = snapshots.after || {};
   const observed = (audit.observed || {}).spools || {};
+  const remediationSpools = (remediation || {}).spools || {};
   const mappings = (audit.config || {}).slot_mappings || {};
   const ids = [...new Set([...Object.keys(before), ...Object.keys(after), ...Object.keys(observed)])].sort((a, b) => Number(a) - Number(b));
   if (!ids.length) return el("div", { class: "audit-empty", text: "No mapped spools were captured." });
@@ -729,6 +772,23 @@ function renderAuditSpools(audit) {
       el("div", {}, [el("span", { text: "Observed used_length" }), el("strong", { text: auditMetric(metric.observed_mm) })]),
     ]);
     const card = el("section", { class: "audit-spool-card" }, [head, grid]);
+    const action = remediationSpools[id] || {};
+    if (action.kind === "fixable_missing" && action.can_fix) {
+      const button = el("button", {
+        class: "btn btn-primary btn-mini audit-fix-btn",
+        attrs: { type: "button" },
+        text: `Fix missing ${auditFixLengthMm(action.missing_mm)}`,
+      });
+      button.onclick = () => fixAuditSpool(audit, Number(id), Number(action.missing_mm), button);
+      card.appendChild(el("div", { class: "audit-remediation audit-remediation-fix" }, [
+        el("span", { text: "A confirmed under-deduction can be completed after one fresh inventory check." }),
+        button,
+      ]));
+    } else if (action.kind === "excess_manual") {
+      card.appendChild(el("div", { class: "audit-remediation audit-remediation-manual", text: action.reason }));
+    } else if (action.kind === "blocked_missing" || action.kind === "inconclusive") {
+      card.appendChild(el("div", { class: "audit-inline-warning", text: action.reason || "This discrepancy cannot be corrected automatically." }));
+    }
     const error = first.error || last.error;
     if (error) card.appendChild(el("div", { class: "audit-inline-warning", text: error }));
     wrap.appendChild(card);
@@ -753,7 +813,7 @@ function renderAuditTimeline(audit) {
       el("span", { class: "status-chip", attrs: { "data-status": kind.key }, text: kind.label }),
     ]);
     const retryable = ["failed", "pending", "skipped_invalid_spool", "skipped_unmapped", "dry_run"].includes(String(event.status || ""));
-    if (latestByKey.get(event.record_key) === index && event.phase !== "live" && retryable) {
+    if (latestByKey.get(event.record_key) === index && event.phase !== "live" && event.phase !== "audit_fix" && retryable) {
       row.appendChild(el("button", {
         class: "btn btn-secondary btn-mini",
         text: "Sync now",
@@ -774,7 +834,9 @@ async function openAuditModal(auditId) {
   body.appendChild(el("div", { class: "audit-loading", text: "Loading audit…" }));
   try {
     const payload = await getJson(`/api/ui/audits/${encodeURIComponent(auditId)}`);
-    const audit = (payload.result || payload).audit;
+    const detail = payload.result || payload;
+    const audit = detail.audit;
+    const remediation = detail.remediation || {};
     $("auditModalTitle").textContent = audit.filename || "Print audit";
     $("auditModalSub").textContent = `${audit.result || "printing"} · ${fmtDateTime(audit.completed_at || audit.started_at)}`;
     body.innerHTML = "";
@@ -784,8 +846,13 @@ async function openAuditModal(auditId) {
       el("p", { text: audit.reasoning || "No verdict reasoning is available yet." }),
       el("a", { class: "btn btn-secondary btn-mini", text: "Download audit report", attrs: { href: `/api/ui/audits/${encodeURIComponent(audit.audit_id)}/export` } }),
     ]));
+    const notice = auditModalNotices.get(audit.audit_id);
+    if (notice) {
+      body.appendChild(el("div", { class: "audit-inline-warning", text: notice }));
+      auditModalNotices.delete(audit.audit_id);
+    }
     body.appendChild(el("h4", { class: "audit-section-title", text: "Spool evidence" }));
-    body.appendChild(renderAuditSpools(audit));
+    body.appendChild(renderAuditSpools(audit, remediation));
     if ((audit.warnings || []).length) {
       body.appendChild(el("h4", { class: "audit-section-title", text: "Warnings" }));
       body.appendChild(el("ul", { class: "audit-warnings" }, audit.warnings.map((warning) => el("li", { text: warning }))));

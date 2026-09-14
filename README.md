@@ -53,6 +53,7 @@ The implementation is intentionally conservative:
 - post-print or live Spoolman usage sync
 - automatic print-level audit history with downloadable JSON reports
 - manual retry for safe retryable records
+- guarded per-spool correction for confirmed missing audit deductions
 - debug mode for dry-run and local test-data cleanup controls
 - warning when Moonraker's native Spoolman integration appears to be enabled
 - tests for sync safety, parser behavior, and failure handling
@@ -164,6 +165,15 @@ records. It opens a detailed spool/evidence/event view and offers a
 **Download audit report** action. Exported
 JSON contains the frozen evidence, reasoning, warnings, and compact sync events;
 configured URLs and raw CFS payloads are excluded.
+
+When a completed audit has complete evidence of a missing deduction, its spool
+card can offer **Fix missing ... mm**. The action is manual and per spool: it
+first reads `used_length` from the audit's frozen Spoolman server, then sends
+only the still-missing length if it exactly matches the amount the user
+confirmed. A changed discrepancy requires a new confirmation and makes no
+write. Timeout-uncertain or conflict records, missing evidence, disabled sync,
+and dry-run all block the action. Excess deductions are never reversed by the
+app because their source cannot be proved; correct those manually in Spoolman.
 
 ## Requirements
 
@@ -380,13 +390,15 @@ Controls Spoolman integration:
 - slot-to-spool mappings
 - compact print-level audit rows with expected and observed usage
 - detailed before/after spool evidence, warnings, and raw sync-event timeline
-- report download and retry buttons for eligible non-live records
+- report download, safe retry controls for eligible non-live records, and a
+  guarded per-spool **Fix missing** control for proven under-deductions
 
 Mapped rows display spool color, id, name, material, and remaining weight when
 Spoolman details are available. Records created before Print Audits remain
 visible as legacy records without an invented verdict. Live sync records are
 informational and are not manually retryable; later live chunks or the final
-record handle reconciliation.
+record handle reconciliation. Audit-correction records are also never retried
+through **Sync now**: each correction must begin with a fresh inventory check.
 
 ### Debug Mode
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import Dict, Literal, Optional, Any
 import time
 from datetime import datetime, timezone
@@ -277,3 +278,26 @@ class UiSpoolmanMappingRequest(BaseModel):
 
 class UiSpoolmanRetryRequest(BaseModel):
     record_key: str
+
+
+class UiSpoolmanAuditFixRequest(BaseModel):
+    """A user-confirmed, per-spool correction for a completed print audit."""
+
+    audit_id: str = Field(min_length=1)
+    spool_id: int = Field(gt=0)
+    expected_missing_mm: float = Field(gt=0)
+
+    @field_validator("audit_id")
+    @classmethod
+    def audit_id_must_not_be_blank(cls, value: str) -> str:
+        value = str(value or "").strip()
+        if not value:
+            raise ValueError("audit_id must not be blank")
+        return value
+
+    @field_validator("expected_missing_mm")
+    @classmethod
+    def missing_length_must_be_finite(cls, value: float) -> float:
+        if not math.isfinite(value):
+            raise ValueError("expected_missing_mm must be finite")
+        return float(value)

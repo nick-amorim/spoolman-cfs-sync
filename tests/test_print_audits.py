@@ -1,6 +1,7 @@
 import json
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -616,3 +617,492 @@ def test_legacy_records_remain_available_without_audit_verdict(audit_env, monkey
     payload = appmod.api_ui_audits().result
     assert payload["legacy_records"][0]["record_key"] == "legacy:1A"
     assert "verdict" not in payload["legacy_records"][0]
+
+
+def _complete_missing_audit(state, cfg, calls, monkeypatch, *, used_mm=100.0):
+    """Finish an audit whose original write was acknowledged but did not apply."""
+    def unapplied_use(spool_id, amount, cfg=None):
+        calls.append((int(spool_id), float(amount)))
+        return {"id": int(spool_id), "used_length": 1000.0}
+
+    monkeypatch.setattr(appmod, "_spoolman_use_spool", unapplied_use)
+    start_audit(state, cfg)
+    state.job_track_slot_mm = {"1A": used_mm}
+    state.job_track_printer_used_mm = used_mm
+    appmod._plan_spoolman_sync_for_finished_job(state, "part.gcode", 10, 20, "complete", "job-1", used_mm)
+    audit = completed_audit()
+    assert audit["verdict"] == "needs_attention"
+    return audit
+
+
+def test_audit_detail_exposes_per_spool_fix_for_confirmed_missing_usage(audit_env, monkeypatch):
+    state, cfg, _inventory, calls = audit_env
+    audit = _complete_missing_audit(state, cfg, calls, monkeypatch)
+    monkeypatch.setattr(appmod, "load_state", lambda: state)
+
+    detail = appmod.api_ui_audit_detail(audit["audit_id"]).result
+    remediation = detail["remediation"]["spools"]["1"]
+
+    assert remediation["kind"] == "fixable_missing"
+    assert remediation["can_fix"] is True
+    assert remediation["missing_mm"] == 100.0
+    assert remediation["source_slots"] == ["1A"]
+
+
+def test_audit_fix_deducts_only_the_fresh_confirmed_shortfall(audit_env, monkeypatch):
+    state, cfg, inventory, calls = audit_env
+    audit = _complete_missing_audit(state, cfg, calls, monkeypatch)
+
+    def apply_use(spool_id, amount, cfg=None):
+        calls.append((int(spool_id), float(amount)))
+        inventory[int(spool_id)]["used_length"] += float(amount)
+        inventory[int(spool_id)]["remaining_length"] -= float(amount)
+        return {"id": int(spool_id), "used_length": inventory[int(spool_id)]["used_length"]}
+
+    monkeypatch.setattr(appmod, "_spoolman_use_spool", apply_use)
+    monkeypatch.setattr(appmod, "load_state", lambda: state)
+    result = appmod.api_ui_spoolman_audit_fix(
+        appmod.UiSpoolmanAuditFixRequest(
+            audit_id=audit["audit_id"], spool_id=1, expected_missing_mm=100.0,
+        )
+    ).result
+
+    assert calls == [(1, 100.0), (1, 100.0)]
+    assert result["correction"]["status"] == "synced"
+    assert result["correction"]["missing_mm"] == 100.0
+    correction = state.spoolman_sync_records[result["correction"]["record_key"]]
+    assert correction["sync_phase"] == "audit_fix"
+    assert correction["used_mm"] == 100.0
+    assert correction["used_g"] == 0.0
+    assert correction["source_slots"] == ["1A"]
+    assert completed_audit()["verdict"] == "verified"
+    assert any(event["phase"] == "audit_fix" for event in completed_audit()["events"])
+
+
+def test_audit_fix_rejects_stale_confirmation_without_writing(audit_env, monkeypatch):
+    state, cfg, inventory, calls = audit_env
+    audit = _complete_missing_audit(state, cfg, calls, monkeypatch)
+    inventory[1]["used_length"] += 25.0
+    monkeypatch.setattr(appmod, "load_state", lambda: state)
+
+    with pytest.raises(appmod.HTTPException) as exc:
+        appmod.api_ui_spoolman_audit_fix(
+            appmod.UiSpoolmanAuditFixRequest(
+                audit_id=audit["audit_id"], spool_id=1, expected_missing_mm=100.0,
+            )
+        )
+
+    assert exc.value.status_code == 409
+    assert "changed" in str(exc.value.detail)
+    assert calls == [(1, 100.0)]
+    assert inventory[1]["used_length"] == 1025.0
+
+
+def test_audit_fix_blocks_uncertain_original_record(audit_env, monkeypatch):
+    state, cfg, _inventory, _calls = audit_env
+
+    def timeout_use(_spool_id, _amount, cfg=None):
+        raise appmod.SpoolmanTimeoutError("network timeout")
+
+    monkeypatch.setattr(appmod, "_spoolman_use_spool", timeout_use)
+    start_audit(state, cfg)
+    state.job_track_slot_mm = {"1A": 100.0}
+    state.job_track_printer_used_mm = 100.0
+    appmod._plan_spoolman_sync_for_finished_job(state, "part.gcode", 10, 20, "complete", "job-1", 100.0)
+    audit = completed_audit()
+    assert audit["verdict"] == "needs_attention"
+    assert next(iter(state.spoolman_sync_records.values()))["status"] == "timeout_uncertain"
+    monkeypatch.setattr(appmod, "load_state", lambda: state)
+
+    with pytest.raises(appmod.HTTPException) as exc:
+        appmod.api_ui_spoolman_audit_fix(
+            appmod.UiSpoolmanAuditFixRequest(
+                audit_id=audit["audit_id"], spool_id=1, expected_missing_mm=100.0,
+            )
+        )
+
+    assert exc.value.status_code == 409
+    assert "may already have changed inventory" in str(exc.value.detail)
+
+
+def test_audit_fix_never_reverses_an_excess_deduction(audit_env, monkeypatch):
+    state, cfg, inventory, calls = audit_env
+
+    def excess_use(spool_id, amount, cfg=None):
+        calls.append((int(spool_id), float(amount)))
+        inventory[int(spool_id)]["used_length"] += float(amount) + 25.0
+        return {"id": int(spool_id), "used_length": inventory[int(spool_id)]["used_length"]}
+
+    monkeypatch.setattr(appmod, "_spoolman_use_spool", excess_use)
+    start_audit(state, cfg)
+    state.job_track_slot_mm = {"1A": 100.0}
+    state.job_track_printer_used_mm = 100.0
+    appmod._plan_spoolman_sync_for_finished_job(state, "part.gcode", 10, 20, "complete", "job-1", 100.0)
+    audit = completed_audit()
+    assert audit["verdict"] == "needs_attention"
+    monkeypatch.setattr(appmod, "load_state", lambda: state)
+
+    with pytest.raises(appmod.HTTPException) as exc:
+        appmod.api_ui_spoolman_audit_fix(
+            appmod.UiSpoolmanAuditFixRequest(
+                audit_id=audit["audit_id"], spool_id=1, expected_missing_mm=100.0,
+            )
+        )
+
+    assert exc.value.status_code == 409
+    assert "too much" in str(exc.value.detail)
+    assert calls == [(1, 100.0)]
+
+
+@pytest.mark.parametrize("control", ["enabled", "dry_run"])
+def test_audit_fix_respects_current_runtime_safety_controls(audit_env, monkeypatch, control):
+    state, cfg, _inventory, calls = audit_env
+    audit = _complete_missing_audit(state, cfg, calls, monkeypatch)
+    cfg[control] = False if control == "enabled" else True
+    monkeypatch.setattr(appmod, "load_state", lambda: state)
+
+    with pytest.raises(appmod.HTTPException) as exc:
+        appmod.api_ui_spoolman_audit_fix(
+            appmod.UiSpoolmanAuditFixRequest(
+                audit_id=audit["audit_id"], spool_id=1, expected_missing_mm=100.0,
+            )
+        )
+
+    assert exc.value.status_code == 409
+    assert "Enable real Spoolman sync" in str(exc.value.detail)
+    assert calls == [(1, 100.0)]
+
+
+def test_audit_fix_uses_the_frozen_server_and_audited_spool(audit_env, monkeypatch):
+    state, cfg, inventory, calls = audit_env
+    audit = _complete_missing_audit(state, cfg, calls, monkeypatch)
+    original_url = cfg["url"]
+    seen_urls = []
+
+    def get_spool(spool_id, effective_cfg=None):
+        seen_urls.append(effective_cfg["url"])
+        return json.loads(json.dumps(inventory[int(spool_id)]))
+
+    def apply_use(spool_id, amount, effective_cfg=None):
+        assert int(spool_id) == 1
+        assert effective_cfg["url"] == original_url
+        calls.append((int(spool_id), float(amount)))
+        inventory[int(spool_id)]["used_length"] += float(amount)
+        return {"id": int(spool_id), "used_length": inventory[int(spool_id)]["used_length"]}
+
+    cfg.update({"url": "http://changed.test:7912"})
+    cfg["slot_mappings"]["1A"] = 2
+    monkeypatch.setattr(appmod, "_spoolman_get_spool", get_spool)
+    monkeypatch.setattr(appmod, "_spoolman_use_spool", apply_use)
+    monkeypatch.setattr(appmod, "load_state", lambda: state)
+    appmod.api_ui_spoolman_audit_fix(
+        appmod.UiSpoolmanAuditFixRequest(
+            audit_id=audit["audit_id"], spool_id=1, expected_missing_mm=100.0,
+        )
+    )
+
+    assert seen_urls and set(seen_urls) == {original_url}
+    assert calls == [(1, 100.0), (1, 100.0)]
+
+
+def test_audit_fix_records_cannot_use_the_generic_retry_endpoint(audit_env, monkeypatch):
+    state, cfg, inventory, calls = audit_env
+    audit = _complete_missing_audit(state, cfg, calls, monkeypatch)
+
+    def apply_use(spool_id, amount, cfg=None):
+        calls.append((int(spool_id), float(amount)))
+        inventory[int(spool_id)]["used_length"] += float(amount)
+        return {"id": int(spool_id), "used_length": inventory[int(spool_id)]["used_length"]}
+
+    monkeypatch.setattr(appmod, "_spoolman_use_spool", apply_use)
+    monkeypatch.setattr(appmod, "load_state", lambda: state)
+    result = appmod.api_ui_spoolman_audit_fix(
+        appmod.UiSpoolmanAuditFixRequest(
+            audit_id=audit["audit_id"], spool_id=1, expected_missing_mm=100.0,
+        )
+    ).result
+
+    with pytest.raises(appmod.HTTPException) as exc:
+        appmod.api_ui_spoolman_retry(
+            appmod.UiSpoolmanRetryRequest(record_key=result["correction"]["record_key"])
+        )
+
+    assert exc.value.status_code == 409
+    assert "fresh inventory check" in str(exc.value.detail)
+
+
+def test_audit_fix_sends_only_the_partial_missing_difference(audit_env, monkeypatch):
+    state, cfg, inventory, calls = audit_env
+
+    def partial_use(spool_id, amount, cfg=None):
+        calls.append((int(spool_id), float(amount)))
+        inventory[int(spool_id)]["used_length"] += 25.0
+        return {"id": int(spool_id), "used_length": inventory[int(spool_id)]["used_length"]}
+
+    monkeypatch.setattr(appmod, "_spoolman_use_spool", partial_use)
+    start_audit(state, cfg)
+    state.job_track_slot_mm = {"1A": 100.0}
+    state.job_track_printer_used_mm = 100.0
+    appmod._plan_spoolman_sync_for_finished_job(state, "part.gcode", 10, 20, "complete", "job-1", 100.0)
+    audit = completed_audit()
+    assert audit["observed"]["spools"]["1"]["difference_mm"] == -75.0
+    monkeypatch.setattr(appmod, "load_state", lambda: state)
+
+    result = appmod.api_ui_spoolman_audit_fix(
+        appmod.UiSpoolmanAuditFixRequest(
+            audit_id=audit["audit_id"], spool_id=1, expected_missing_mm=75.0,
+        )
+    ).result
+
+    assert result["correction"]["status"] == "synced"
+    assert calls == [(1, 100.0), (1, 75.0)]
+
+
+def test_audit_fix_refreshes_without_write_when_external_change_already_resolved_it(audit_env, monkeypatch):
+    state, cfg, inventory, calls = audit_env
+    audit = _complete_missing_audit(state, cfg, calls, monkeypatch)
+    inventory[1]["used_length"] += 100.0
+    monkeypatch.setattr(appmod, "load_state", lambda: state)
+
+    result = appmod.api_ui_spoolman_audit_fix(
+        appmod.UiSpoolmanAuditFixRequest(
+            audit_id=audit["audit_id"], spool_id=1, expected_missing_mm=100.0,
+        )
+    ).result
+
+    assert result["correction"] == {"status": "not_needed", "missing_mm": 0.0}
+    assert calls == [(1, 100.0)]
+    assert completed_audit()["verdict"] == "verified"
+
+
+def test_audit_fix_blocks_missing_start_or_current_inventory_evidence(audit_env, monkeypatch):
+    state, cfg, _inventory, calls = audit_env
+    audit = _complete_missing_audit(state, cfg, calls, monkeypatch)
+    store = appmod.load_audits()
+    store["completed"][0]["snapshots"]["before"]["1"]["used_length_mm"] = None
+    appmod.save_audits(store)
+    monkeypatch.setattr(appmod, "load_state", lambda: state)
+
+    with pytest.raises(appmod.HTTPException) as missing_before:
+        appmod.api_ui_spoolman_audit_fix(
+            appmod.UiSpoolmanAuditFixRequest(
+                audit_id=audit["audit_id"], spool_id=1, expected_missing_mm=100.0,
+            )
+        )
+
+    assert missing_before.value.status_code == 409
+    assert calls == [(1, 100.0)]
+
+
+def test_audit_fix_blocks_missing_fresh_spoolman_evidence(audit_env, monkeypatch):
+    state, cfg, _inventory, calls = audit_env
+    audit = _complete_missing_audit(state, cfg, calls, monkeypatch)
+
+    def unavailable_get(_spool_id, cfg=None):
+        raise appmod.SpoolmanHttpError(503, "Spoolman unavailable")
+
+    monkeypatch.setattr(appmod, "_spoolman_get_spool", unavailable_get)
+    monkeypatch.setattr(appmod, "load_state", lambda: state)
+    with pytest.raises(appmod.HTTPException) as exc:
+        appmod.api_ui_spoolman_audit_fix(
+            appmod.UiSpoolmanAuditFixRequest(
+                audit_id=audit["audit_id"], spool_id=1, expected_missing_mm=100.0,
+            )
+        )
+
+    assert exc.value.status_code == 502
+    assert calls == [(1, 100.0)]
+
+
+def test_audit_fix_rejects_unknown_active_and_non_attention_audits(audit_env, monkeypatch):
+    state, cfg, _inventory, calls = audit_env
+    monkeypatch.setattr(appmod, "load_state", lambda: state)
+    with pytest.raises(appmod.HTTPException) as unknown:
+        appmod.api_ui_spoolman_audit_fix(
+            appmod.UiSpoolmanAuditFixRequest(audit_id="missing", spool_id=1, expected_missing_mm=10.0)
+        )
+    assert unknown.value.status_code == 404
+
+    active = start_audit(state, cfg)
+    with pytest.raises(appmod.HTTPException) as active_error:
+        appmod.api_ui_spoolman_audit_fix(
+            appmod.UiSpoolmanAuditFixRequest(audit_id=active["audit_id"], spool_id=1, expected_missing_mm=10.0)
+        )
+    assert active_error.value.status_code == 409
+    assert calls == []
+
+
+def test_audit_fix_blocks_conflicting_audit_record(audit_env, monkeypatch):
+    state, cfg, _inventory, calls = audit_env
+    audit = _complete_missing_audit(state, cfg, calls, monkeypatch)
+    state.spoolman_sync_records["manual-conflict"] = {
+        "audit_id": audit["audit_id"], "spool_id": 1, "status": "conflict", "sync_phase": "audit_fix",
+    }
+    monkeypatch.setattr(appmod, "load_state", lambda: state)
+
+    with pytest.raises(appmod.HTTPException) as exc:
+        appmod.api_ui_spoolman_audit_fix(
+            appmod.UiSpoolmanAuditFixRequest(
+                audit_id=audit["audit_id"], spool_id=1, expected_missing_mm=100.0,
+            )
+        )
+
+    assert exc.value.status_code == 409
+    assert "may already have changed inventory" in str(exc.value.detail)
+    assert calls == [(1, 100.0)]
+
+
+def test_audit_fix_timeout_blocks_a_later_correction_attempt(audit_env, monkeypatch):
+    state, cfg, _inventory, calls = audit_env
+    audit = _complete_missing_audit(state, cfg, calls, monkeypatch)
+
+    def timeout_use(spool_id, amount, cfg=None):
+        calls.append((int(spool_id), float(amount)))
+        raise appmod.SpoolmanTimeoutError("network timeout")
+
+    monkeypatch.setattr(appmod, "_spoolman_use_spool", timeout_use)
+    monkeypatch.setattr(appmod, "load_state", lambda: state)
+    first = appmod.api_ui_spoolman_audit_fix(
+        appmod.UiSpoolmanAuditFixRequest(
+            audit_id=audit["audit_id"], spool_id=1, expected_missing_mm=100.0,
+        )
+    ).result
+    assert first["correction"]["status"] == "timeout_uncertain"
+
+    with pytest.raises(appmod.HTTPException) as blocked:
+        appmod.api_ui_spoolman_audit_fix(
+            appmod.UiSpoolmanAuditFixRequest(
+                audit_id=audit["audit_id"], spool_id=1, expected_missing_mm=100.0,
+            )
+        )
+
+    assert blocked.value.status_code == 409
+    assert calls == [(1, 100.0), (1, 100.0)]
+
+
+def test_audit_fix_clean_validation_failure_retries_only_the_same_fresh_basis(audit_env, monkeypatch):
+    state, cfg, inventory, calls = audit_env
+    audit = _complete_missing_audit(state, cfg, calls, monkeypatch)
+    get_count = {"value": 0}
+
+    def intermittent_get(spool_id, cfg=None):
+        get_count["value"] += 1
+        if get_count["value"] == 2:
+            raise appmod.SpoolmanHttpError(503, "validation unavailable")
+        return json.loads(json.dumps(inventory[int(spool_id)]))
+
+    def apply_use(spool_id, amount, cfg=None):
+        calls.append((int(spool_id), float(amount)))
+        inventory[int(spool_id)]["used_length"] += float(amount)
+        return {"id": int(spool_id), "used_length": inventory[int(spool_id)]["used_length"]}
+
+    monkeypatch.setattr(appmod, "_spoolman_get_spool", intermittent_get)
+    monkeypatch.setattr(appmod, "_spoolman_use_spool", apply_use)
+    monkeypatch.setattr(appmod, "load_state", lambda: state)
+    request = appmod.UiSpoolmanAuditFixRequest(
+        audit_id=audit["audit_id"], spool_id=1, expected_missing_mm=100.0,
+    )
+
+    failed = appmod.api_ui_spoolman_audit_fix(request).result
+    retried = appmod.api_ui_spoolman_audit_fix(request).result
+
+    assert failed["correction"]["status"] == "failed"
+    assert retried["correction"]["status"] == "synced"
+    assert failed["correction"]["record_key"] == retried["correction"]["record_key"]
+    assert calls == [(1, 100.0), (1, 100.0)]
+
+
+def test_audit_fix_is_aggregated_per_shared_spool(audit_env, monkeypatch):
+    state, cfg, inventory, calls = audit_env
+    cfg["slot_mappings"].update({"1A": 1, "1B": 1})
+
+    def unapplied_use(spool_id, amount, cfg=None):
+        calls.append((int(spool_id), float(amount)))
+        return {"id": int(spool_id), "used_length": inventory[int(spool_id)]["used_length"]}
+
+    monkeypatch.setattr(appmod, "_spoolman_use_spool", unapplied_use)
+    start_audit(state, cfg)
+    state.job_track_slot_mm = {"1A": 75.0, "1B": 125.0}
+    state.job_track_printer_used_mm = 200.0
+    appmod._plan_spoolman_sync_for_finished_job(state, "part.gcode", 10, 20, "complete", "job-1", 200.0)
+    audit = completed_audit()
+    assert audit["expected"]["spools"] == {"1": 200.0}
+    monkeypatch.setattr(appmod, "load_state", lambda: state)
+
+    def apply_use(spool_id, amount, cfg=None):
+        calls.append((int(spool_id), float(amount)))
+        inventory[int(spool_id)]["used_length"] += float(amount)
+        return {"id": int(spool_id), "used_length": inventory[int(spool_id)]["used_length"]}
+
+    monkeypatch.setattr(appmod, "_spoolman_use_spool", apply_use)
+    result = appmod.api_ui_spoolman_audit_fix(
+        appmod.UiSpoolmanAuditFixRequest(
+            audit_id=audit["audit_id"], spool_id=1, expected_missing_mm=200.0,
+        )
+    ).result
+
+    assert result["correction"]["status"] == "synced"
+    assert calls == [(1, 75.0), (1, 125.0), (1, 200.0)]
+    assert state.spoolman_sync_records[result["correction"]["record_key"]]["source_slots"] == ["1A", "1B"]
+
+
+def test_audit_fix_leaves_other_spool_discrepancies_for_independent_review(audit_env, monkeypatch):
+    state, cfg, inventory, calls = audit_env
+    cfg["slot_mappings"].update({"1A": 1, "1B": 2})
+
+    def unapplied_use(spool_id, amount, cfg=None):
+        calls.append((int(spool_id), float(amount)))
+        return {"id": int(spool_id), "used_length": inventory[int(spool_id)]["used_length"]}
+
+    monkeypatch.setattr(appmod, "_spoolman_use_spool", unapplied_use)
+    start_audit(state, cfg)
+    state.job_track_slot_mm = {"1A": 100.0, "1B": 100.0}
+    state.job_track_printer_used_mm = 200.0
+    appmod._plan_spoolman_sync_for_finished_job(state, "part.gcode", 10, 20, "complete", "job-1", 200.0)
+    audit = completed_audit()
+    monkeypatch.setattr(appmod, "load_state", lambda: state)
+
+    def apply_use(spool_id, amount, cfg=None):
+        calls.append((int(spool_id), float(amount)))
+        inventory[int(spool_id)]["used_length"] += float(amount)
+        return {"id": int(spool_id), "used_length": inventory[int(spool_id)]["used_length"]}
+
+    monkeypatch.setattr(appmod, "_spoolman_use_spool", apply_use)
+    result = appmod.api_ui_spoolman_audit_fix(
+        appmod.UiSpoolmanAuditFixRequest(
+            audit_id=audit["audit_id"], spool_id=1, expected_missing_mm=100.0,
+        )
+    ).result
+
+    assert result["audit"]["verdict"] == "needs_attention"
+    assert result["remediation"]["spools"]["2"]["can_fix"] is True
+    assert calls == [(1, 100.0), (2, 100.0), (1, 100.0)]
+
+
+def test_audit_fix_serializes_concurrent_requests_without_double_deducting(audit_env, monkeypatch):
+    state, cfg, inventory, calls = audit_env
+    audit = _complete_missing_audit(state, cfg, calls, monkeypatch)
+
+    def slow_apply(spool_id, amount, cfg=None):
+        time.sleep(0.05)
+        calls.append((int(spool_id), float(amount)))
+        inventory[int(spool_id)]["used_length"] += float(amount)
+        return {"id": int(spool_id), "used_length": inventory[int(spool_id)]["used_length"]}
+
+    monkeypatch.setattr(appmod, "_spoolman_use_spool", slow_apply)
+    monkeypatch.setattr(appmod, "load_state", lambda: state)
+    request = appmod.UiSpoolmanAuditFixRequest(
+        audit_id=audit["audit_id"], spool_id=1, expected_missing_mm=100.0,
+    )
+
+    def attempt():
+        try:
+            return appmod.api_ui_spoolman_audit_fix(request).result["correction"]["status"]
+        except appmod.HTTPException as exc:
+            return exc.status_code
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = list(executor.map(lambda _index: attempt(), range(2)))
+
+    assert sorted(outcomes, key=str) == [409, "synced"]
+    assert calls == [(1, 100.0), (1, 100.0)]
